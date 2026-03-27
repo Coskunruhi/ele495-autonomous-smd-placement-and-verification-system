@@ -112,7 +112,7 @@ The system is operated through the web interface.
 
 ### Demo Video
 
-YouTube playlist: [https://www.youtube.com/playlist?list=PLzf3Rj-UtPXAsXfPFxSmgzhPaKz0aSkCq]
+YouTube playlist: [Project Demo Playlist](https://www.youtube.com/playlist?list=PLzf3Rj-UtPXAsXfPFxSmgzhPaKz0aSkCq)
 
 ## Project Structure
 
