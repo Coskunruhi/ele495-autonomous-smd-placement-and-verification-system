@@ -1,0 +1,1509 @@
+
+#!/usr/bin/env python3
+import re
+import time
+import serial
+import os
+import json
+import subprocess
+
+# =========================================================
+# WEB LOG CALLBACK
+# =========================================================
+LOG_FULL_CB = None
+LOG_USER_CB = None
+
+def set_log_callbacks(full_cb=None, user_cb=None):
+    global LOG_FULL_CB, LOG_USER_CB
+    LOG_FULL_CB = full_cb
+    LOG_USER_CB = user_cb
+
+def log_full(msg: str):
+    print(msg)
+    if LOG_FULL_CB:
+        try:
+            LOG_FULL_CB(msg)
+        except Exception:
+            pass
+
+def log_user(msg: str):
+    print(msg)
+    if LOG_USER_CB:
+        try:
+            LOG_USER_CB(msg)
+        except Exception:
+            pass
+
+# =========================================================
+# PORTLAR
+# =========================================================
+PRINTER_PORT = "/dev/ttyUSB1"
+ARDUINO_PORT = "/dev/ttyACM0"
+NANO_PORT    = "/dev/ttyUSB0"
+
+PRINTER_BAUD = 115200
+ARDUINO_BAUD = 9600
+NANO_BAUD    = 115200
+
+# =========================================================
+# YERLEŞTİRME DOĞRULAMA
+# =========================================================
+PLACEMENT_VERIFIER_PY = "/home/pi/vision/placement_verifier.py"
+PLACEMENT_VERIFIER_PYTHON = "/home/pi/vision/.venv/bin/python"
+PLACEMENT_RESULT_JSON = "/home/pi/vision/placement_result.json"
+PLACEMENT_DEBUG_IMG = "/home/pi/vision/placement_debug.jpg"
+
+def get_placement_calib_json(mode: int) -> str:
+    if mode == 1:
+        return "/home/pi/vision/placement_calibration_2d2r.json"
+    elif mode == 2:
+        return "/home/pi/vision/placement_calibration_4r.json"
+    raise RuntimeError(f"Bilinmeyen mod: {mode}")
+
+# =========================================================
+# FARK
+# =========================================================
+X_Diff = 0.3
+Y_Diff = 0
+
+# =========================================================
+# REFERANS / HOME / SAFE
+# =========================================================
+HOME_X = 5.0
+HOME_Y = 5.0
+SAFE_Z = 25.0
+
+# =========================================================
+# DİYOT ALMA YERLERİ
+# =========================================================
+DIODE_PICK1_X = 44.5 + X_Diff
+DIODE_PICK1_Y = 77.2 + Y_Diff
+DIODE_PICK1_Z = 4.5
+
+DIODE_PICK2_X = 63.0 + X_Diff
+DIODE_PICK2_Y = 78.0 + Y_Diff
+DIODE_PICK2_Z = 5.0
+
+DIODE_PICK_LIST = [
+    ("DIODE_PICK1", DIODE_PICK1_X, DIODE_PICK1_Y, DIODE_PICK1_Z),
+    ("DIODE_PICK2", DIODE_PICK2_X, DIODE_PICK2_Y, DIODE_PICK2_Z),
+]
+
+# =========================================================
+# DİRENÇ ALMA YERLERİ
+# =========================================================
+RES_PICK1_X = 129.6 + X_Diff
+RES_PICK1_Y = 114.7 + Y_Diff
+RES_PICK1_Z = 4.5
+
+RES_PICK2_X = 139.3 + X_Diff
+RES_PICK2_Y = 113.9 + Y_Diff
+RES_PICK2_Z = 4.5
+
+RES_PICK3_X = 148.9 + X_Diff
+RES_PICK3_Y = 113.0 + Y_Diff
+RES_PICK3_Z = 4.5
+
+RES_PICK4_X = 158.1 + X_Diff
+RES_PICK4_Y = 113.4 + Y_Diff
+RES_PICK4_Z = 4.5
+
+RESISTOR_PICK_LIST = [
+    ("R_PICK1", RES_PICK1_X, RES_PICK1_Y, RES_PICK1_Z),
+    ("R_PICK2", RES_PICK2_X, RES_PICK2_Y, RES_PICK2_Z),
+    ("R_PICK3", RES_PICK3_X, RES_PICK3_Y, RES_PICK3_Z),
+    ("R_PICK4", RES_PICK4_X, RES_PICK4_Y, RES_PICK4_Z),
+]
+
+# =========================================================
+# TEST İSTASYONLARI
+# =========================================================
+DIODE_TEST_X = 28.20 + X_Diff
+DIODE_TEST_Y = 113.5 + Y_Diff
+DIODE_TEST_Z = 9.0
+
+RES_TEST_X = 20.8 + X_Diff
+RES_TEST_Y = 180.4 + Y_Diff
+RES_TEST_Z = 8.5
+
+# =========================================================
+# YERLEŞTİRME SLOTLARI - MOD 1 (2D2R)
+# =========================================================
+D1_2D2R_X = 134.70 + X_Diff
+D1_2D2R_Y = 202.0 + Y_Diff
+D1_2D2R_Z = 4.8
+
+D2_2D2R_X = 134.70 + X_Diff
+D2_2D2R_Y = 183.0 + Y_Diff
+D2_2D2R_Z = 4.8
+
+R1_2D2R_X = 164.7 + X_Diff
+R1_2D2R_Y = 201.0 + Y_Diff
+R1_2D2R_Z = 3.3
+
+R2_2D2R_X = 164.7 + X_Diff
+R2_2D2R_Y = 182.0 + Y_Diff
+R2_2D2R_Z = 3.3
+
+SLOT_COORDS_2D2R = {
+    "D1": (D1_2D2R_X, D1_2D2R_Y, D1_2D2R_Z),
+    "D2": (D2_2D2R_X, D2_2D2R_Y, D2_2D2R_Z),
+    "R1": (R1_2D2R_X, R1_2D2R_Y, R1_2D2R_Z),
+    "R2": (R2_2D2R_X, R2_2D2R_Y, R2_2D2R_Z),
+}
+
+# =========================================================
+# YERLEŞTİRME SLOTLARI - MOD 2 (4R)
+# 4R modunda D1 ve D2 de direnç slotu gibi kullanılır
+# Buraya kendi yeni ölçülerini gir
+# =========================================================
+D1_4R_X = 134.70 + X_Diff
+D1_4R_Y = 202.0 + Y_Diff
+D1_4R_Z = 3.3
+
+D2_4R_X = 134.70 + X_Diff
+D2_4R_Y = 183.0 + Y_Diff
+D2_4R_Z = 3.3
+
+R1_4R_X = 164.7 + X_Diff
+R1_4R_Y = 201.0 + Y_Diff
+R1_4R_Z = 3.3
+
+R2_4R_X = 164.7 + X_Diff
+R2_4R_Y = 182.0 + Y_Diff
+R2_4R_Z = 3.3
+
+SLOT_COORDS_4R = {
+    "D1": (D1_4R_X, D1_4R_Y, D1_4R_Z),
+    "D2": (D2_4R_X, D2_4R_Y, D2_4R_Z),
+    "R1": (R1_4R_X, R1_4R_Y, R1_4R_Z),
+    "R2": (R2_4R_X, R2_4R_Y, R2_4R_Z),
+}
+
+def get_slot_coords(mode: int):
+    if mode == 1:
+        return SLOT_COORDS_2D2R
+    elif mode == 2:
+        return SLOT_COORDS_4R
+    raise RuntimeError(f"Bilinmeyen mod: {mode}")
+
+# =========================================================
+# HAREKET HIZLARI
+# =========================================================
+FEED_XY = 3000
+FEED_Z  = 600
+
+# =========================================================
+# BEKLEME SÜRELERİ
+# =========================================================
+PUMP_PICK_WAIT        = 2.0
+AFTER_ROTATE_WAIT     = 1.0
+AFTER_Z_MOVE_WAIT     = 5.0
+TEST_SETTLE_WAIT      = 1.2
+BEFORE_TEST_WAIT      = 0.3
+AFTER_TEST_XY_WAIT    = 1.0
+AFTER_TEST_READY_WAIT = 0.8
+
+RELEASE_WAIT_AFTER_PUMP_OFF = 5.0
+RELEASE_LIFT_Z              = 4.0
+RELEASE_LIFT_WAIT           = 0.6
+
+AFTER_SLOT_XY_WAIT          = 0.6
+AFTER_SLOT_Z_DOWN_WAIT      = 0.3
+SLOT_DWELL_MS_BEFORE_DROP   = 3000
+PRINTER_FLUSH_BEFORE_DROP_S = 10.0
+
+# =========================================================
+# TEST RETRY
+# =========================================================
+TEST_RETRY_COUNT = 4
+TEST_RETRY_WAIT  = 0.6
+
+# =========================================================
+# OKUNAMAYAN DEĞER İÇİN YENİDEN DENEME
+# =========================================================
+UNREADABLE_RETRY_COUNT = 4
+UNREADABLE_WAIT_S = 15.0
+USER_WARNING_TEXT = "LUTFEN DÜZGÜN YERLEŞTİRİN"
+
+# =========================================================
+# DİRENÇ TOLERANSI
+# =========================================================
+RESISTOR_TOLERANCE = 0.20
+
+RESISTOR_TARGETS = {
+    "223":  21400.0,
+    "1001": 1000.0,
+    "332":  3200.0,
+    "331":  350.0,
+}
+
+# =========================================================
+# ROTATE SONRASI XY KAYDIRMA
+# =========================================================
+ROTATED_X_OFFSET = 0.1
+ROTATED_Y_OFFSET = -10
+
+# =========================================================
+# ADIM ADIM ONAY / DEBUG
+# =========================================================
+STEP_BY_STEP_CONFIRM = False
+
+def wait_user(msg: str):
+    if not STEP_BY_STEP_CONFIRM:
+        return
+    input(f"\n[ONAY BEKLENİYOR] {msg} -> Devam için Enter'a bas...")
+
+# =========================================================
+# ÖZEL HATA
+# =========================================================
+class UnreadableMeasurementError(Exception):
+    pass
+
+# =========================================================
+# SERİ CİHAZ
+# =========================================================
+class SerialDevice:
+    def __init__(self, port: str, baud: int, timeout: float = 1.0):
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
+        self.ser = None
+
+    def open(self):
+        self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
+        time.sleep(2.0)
+        log_full(f"[SERIAL OPEN] port={self.port} baud={self.baud}")
+
+    def close(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            log_full(f"[SERIAL CLOSE] port={self.port}")
+
+    def write_line(self, text: str):
+        if not self.ser or not self.ser.is_open:
+            raise RuntimeError(f"Port açık değil: {self.port}")
+        self.ser.write((text + "\n").encode("utf-8"))
+
+    def write_raw(self, text: str):
+        if not self.ser or not self.ser.is_open:
+            raise RuntimeError(f"Port açık değil: {self.port}")
+        self.ser.write(text.encode("utf-8"))
+
+    def read_line(self) -> str:
+        if not self.ser or not self.ser.is_open:
+            raise RuntimeError(f"Port açık değil: {self.port}")
+        return self.ser.readline().decode("utf-8", errors="ignore").strip()
+
+# =========================================================
+# 3D PRINTER
+# =========================================================
+class Printer:
+    def __init__(self, dev: SerialDevice):
+        self.dev = dev
+
+    def connect(self):
+        self.dev.open()
+        time.sleep(0.5)
+        self._drain_boot()
+        self.send("G90")
+        self.send("G21")
+        self.send("M17")
+        log_user("Printer hazır.")
+
+    def _drain_boot(self, max_lines: int = 25):
+        for _ in range(max_lines):
+            line = self.dev.read_line()
+            if not line:
+                break
+            log_full(f"[PRINTER BOOT] {line}")
+
+    def flush_rx(self, duration_s: float = 0.5):
+        log_full(f"[INFO] Printer RX flush: {duration_s:.2f}s")
+        t0 = time.time()
+        while time.time() - t0 < duration_s:
+            line = self.dev.read_line()
+            if line:
+                log_full(f"[PRINTER RX FLUSH] {line}")
+            else:
+                time.sleep(0.02)
+
+    def send(self, gcode: str, timeout: float = None):
+        if timeout is None:
+            cmd = gcode.strip().split()[0].upper() if gcode.strip() else ""
+            if cmd in ("G0", "G1"):
+                timeout = 30.0
+            elif cmd == "M400":
+                timeout = 60.0
+            elif cmd == "G4":
+                timeout = 20.0
+            else:
+                timeout = 10.0
+
+        log_full(f"[PRINTER TX] {gcode}")
+        self.dev.write_line(gcode)
+
+        t0 = time.time()
+        while True:
+            line = self.dev.read_line()
+            if line:
+                log_full(f"[PRINTER RX] {line}")
+                ll = line.lower()
+                if "ok" in ll:
+                    return
+                if "error" in ll:
+                    raise RuntimeError(f"Printer error: {line}")
+
+            if time.time() - t0 > timeout:
+                raise TimeoutError(f"Printer timeout ({timeout}s): {gcode}")
+
+    def wait_all(self):
+        self.send("M400")
+
+    def dwell_ms(self, ms: int):
+        self.send(f"G4 P{int(ms)}")
+
+    def move_xy(self, x: float, y: float, feed: int = FEED_XY):
+        self.send(f"G0 X{x:.3f} Y{y:.3f} F{feed}")
+
+    def move_z(self, z: float, feed: int = FEED_Z):
+        self.send(f"G0 Z{z:.3f} F{feed}")
+
+    def go_safe_only(self):
+        log_full(f"[INFO] SAFE noktasına gidiliyor: Z={SAFE_Z:.2f}")
+        log_user("Güvenli yüksekliğe çıkılıyor.")
+        self.move_z(SAFE_Z)
+        self.wait_all()
+        time.sleep(0.5)
+
+    def go_home(self):
+        log_full(f"[INFO] HOME noktasına gidiliyor: X={HOME_X:.2f}, Y={HOME_Y:.2f}, Z={SAFE_Z:.2f}")
+        log_user("HOME noktasına gidiliyor.")
+        self.move_z(SAFE_Z)
+        self.wait_all()
+        self.move_xy(HOME_X, HOME_Y)
+        self.wait_all()
+        time.sleep(0.5)
+
+# =========================================================
+# ARDUINO
+# =========================================================
+class ArduinoActuator:
+    def __init__(self, dev: SerialDevice):
+        self.dev = dev
+
+    def connect(self):
+        self.dev.open()
+        time.sleep(0.5)
+        self._drain_boot()
+        log_user("Arduino hazır.")
+
+    def _drain_boot(self, max_lines: int = 20):
+        for _ in range(max_lines):
+            line = self.dev.read_line()
+            if not line:
+                break
+            log_full(f"[ARDUINO BOOT] {line}")
+
+    def _send_char(self, c: str, wait_s: float):
+        log_full(f"[ARDUINO TX] {c}")
+        self.dev.write_raw(c)
+        t0 = time.time()
+        while time.time() - t0 < wait_s:
+            line = self.dev.read_line()
+            if line:
+                log_full(f"[ARDUINO RX] {line}")
+
+    def pump_on(self):
+        log_full("[INFO] Vakum açılıyor...")
+        log_user("Vakum açılıyor.")
+        self._send_char("P", wait_s=0.6)
+        time.sleep(PUMP_PICK_WAIT)
+
+    def pump_force_on(self):
+        log_full("[INFO] Vakum FORCE-ON (P) gönderiliyor...")
+        self._send_char("P", wait_s=0.2)
+
+    def pump_off(self):
+        log_full("[INFO] Vakum kapatılıyor...")
+        log_user("Vakum kapatılıyor.")
+        self._send_char("O", wait_s=0.6)
+        time.sleep(0.2)
+
+    def rotate_fwd_180(self):
+        log_full("[INFO] Diyot 180 derece çevriliyor...")
+        log_user("Diyot yönü ters, 180 derece çevriliyor.")
+        self._send_char("F", wait_s=4.2)
+        time.sleep(AFTER_ROTATE_WAIT)
+
+    def rotate_back_180(self):
+        log_full("[INFO] Mekanizma eski yönüne alınıyor...")
+        self._send_char("B", wait_s=4.2)
+        time.sleep(AFTER_ROTATE_WAIT)
+
+# =========================================================
+# NANO DİYOT TEST
+# =========================================================
+class DiodeTester:
+    def __init__(self, dev: SerialDevice):
+        self.dev = dev
+
+    def connect(self):
+        self.dev.open()
+        time.sleep(0.5)
+        self._drain_boot()
+        log_user("Nano hazır.")
+
+    def _drain_boot(self, max_lines: int = 30):
+        for _ in range(max_lines):
+            line = self.dev.read_line()
+            if not line:
+                break
+            log_full(f"[NANO BOOT] {line}")
+
+    def test_once(self, timeout: float = 2.5):
+        log_full("[NANO TX] d")
+        self.dev.write_raw("d")
+
+        lines = []
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            line = self.dev.read_line()
+            if line:
+                log_full(f"[NANO RX] {line}")
+                lines.append(line)
+            else:
+                time.sleep(0.03)
+
+        for line in lines:
+            if line.startswith("D;"):
+                parsed = parse_diode_line(line)
+                if parsed is not None:
+                    return parsed
+
+        raise RuntimeError("Nano diyot çıktısı parse edilemedi")
+
+    def test_with_retry(self, retry_count: int = TEST_RETRY_COUNT, wait_s: float = TEST_RETRY_WAIT):
+        last_err = None
+        for i in range(retry_count):
+            try:
+                log_full(f"[NANO] diyot test denemesi {i+1}/{retry_count}")
+                result = self.test_once()
+                if is_valid_test_result(result):
+                    return result
+                log_full("[NANO] Geçersiz diyot çıktısı, tekrar...")
+            except Exception as e:
+                last_err = e
+                log_full(f"[NANO] Diyot test hatası: {e}")
+            time.sleep(wait_s)
+        raise RuntimeError(f"Nano diyot testi başarısız. Son hata: {last_err}")
+
+# =========================================================
+# NANO DİRENÇ TEST
+# =========================================================
+class ResistorTester:
+    def __init__(self, dev: SerialDevice):
+        self.dev = dev
+
+    def connect(self):
+        pass
+
+    def test_once(self, timeout: float = 3.0):
+        log_full("[NANO TX] r")
+        self.dev.write_raw("r")
+
+        lines = []
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            line = self.dev.read_line()
+            if line:
+                log_full(f"[NANO RX] {line}")
+                lines.append(line)
+            else:
+                time.sleep(0.03)
+
+        for line in lines:
+            ohm = parse_resistor_ohm(line)
+            if ohm is not None:
+                return {"ohm": ohm, "raw": line}
+
+        raise RuntimeError("Nano direnç çıktısı parse edilemedi")
+
+    def test_with_retry(self, retry_count: int = TEST_RETRY_COUNT, wait_s: float = TEST_RETRY_WAIT):
+        last_err = None
+        for i in range(retry_count):
+            try:
+                log_full(f"[NANO] direnç test denemesi {i+1}/{retry_count}")
+                result = self.test_once()
+                if result["ohm"] > 0:
+                    return result
+                log_full("[NANO] Geçersiz direnç çıktısı, tekrar...")
+            except Exception as e:
+                last_err = e
+                log_full(f"[NANO] Direnç test hatası: {e}")
+            time.sleep(wait_s)
+        raise RuntimeError(f"Nano direnç testi başarısız. Son hata: {last_err}")
+
+# =========================================================
+# PARSE / KARAR
+# =========================================================
+def parse_diode_line(line: str):
+    m = re.search(r"V1=(\d+);V2=(\d+);DIFF=(\d+);RES=(.+)$", line)
+    if not m:
+        return None
+    return {
+        "v1": int(m.group(1)),
+        "v2": int(m.group(2)),
+        "diff": int(m.group(3)),
+        "res": m.group(4).strip(),
+        "raw": line
+    }
+
+def parse_resistor_ohm(line: str):
+    patterns = [
+        r"RX\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        r"R\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        r"R\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+        r"RES\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        r"OHM\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        r"([0-9]+(?:\.[0-9]+)?)\s*OHM",
+        r"^([0-9]+(?:\.[0-9]+)?)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, line, flags=re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    return None
+
+def is_valid_test_result(test_result: dict) -> bool:
+    if not test_result:
+        return False
+
+    res = test_result.get("res", "")
+    v1 = test_result.get("v1", -1)
+    v2 = test_result.get("v2", -1)
+    diff = test_result.get("diff", -1)
+
+    if not (("FWD_TEST1" in res) or ("FWD_TEST2" in res)):
+        return False
+
+    if v1 < 0 or v2 < 0 or diff < 0:
+        return False
+
+    if diff < 2000:
+        return False
+
+    return True
+
+def direction_is_correct(test_result: dict) -> bool:
+    return "FWD_TEST2" in test_result["res"]
+
+def classify_diode(test_result: dict) -> str:
+    v1   = test_result["v1"]
+    v2   = test_result["v2"]
+    diff = test_result["diff"]
+    res  = test_result["res"]
+
+    log_full(f"[CLASSIFY-DIODE] v1={v1}, v2={v2}, diff={diff}, res={res}")
+
+    # =====================================================
+    # DİYOT MERKEZ DEĞERLERİ
+    # =====================================================
+    # SK510C ölçümleri
+    # FWD_TEST1:
+    #   v1 ≈ 2732-2733
+    #   diff ≈ 2732-2733
+    # FWD_TEST2:
+    #   v2 ≈ 2243-2277
+    #   diff ≈ 2719-2752
+
+    # S3M ölçümleri
+    # FWD_TEST1:
+    #   v1 ≈ 2903-2925
+    #   diff ≈ 2903-2925
+    # FWD_TEST2:
+    #   v2 ≈ 2141-2164
+    #   diff ≈ 2831-2854
+
+    SK_T1_V1_CENTER   = 2733
+    SK_T1_DIFF_CENTER = 2733
+
+    S3M_T1_V1_CENTER   = 2915
+    S3M_T1_DIFF_CENTER = 2915
+
+    SK_T2_V2_CENTER   = 2257
+    SK_T2_DIFF_CENTER = 2735
+
+    S3M_T2_V2_CENTER   = 2150
+    S3M_T2_DIFF_CENTER = 2842
+
+    # Skorlar çok yakınsa yanlış karar vermek yerine retry'e düşsün
+    UNSURE_GAP = 10
+
+    if "FWD_TEST1" in res:
+        # TEST1 için v1 + diff çok iyi ayırıyor
+        sk_score  = abs(v1 - SK_T1_V1_CENTER)  + abs(diff - SK_T1_DIFF_CENTER)
+        s3m_score = abs(v1 - S3M_T1_V1_CENTER) + abs(diff - S3M_T1_DIFF_CENTER)
+
+        log_full(f"[CLASSIFY-DIODE] TEST1 skor -> SK510C={sk_score}, S3M={s3m_score}")
+
+    elif "FWD_TEST2" in res:
+        # TEST2 için v1 ayırıcı değil, o yüzden v2 + diff kullanıyoruz
+        sk_score  = abs(v2 - SK_T2_V2_CENTER)  + abs(diff - SK_T2_DIFF_CENTER)
+        s3m_score = abs(v2 - S3M_T2_V2_CENTER) + abs(diff - S3M_T2_DIFF_CENTER)
+
+        log_full(f"[CLASSIFY-DIODE] TEST2 skor -> SK510C={sk_score}, S3M={s3m_score}")
+
+    else:
+        raise RuntimeError(f"Sınıflandırma için yön bilgisi yok: {res}")
+
+    score_gap = abs(sk_score - s3m_score)
+    if score_gap < UNSURE_GAP:
+        raise RuntimeError(
+            f"Diyot tipi sınır bölgede kaldı. "
+            f"SK510C skor={sk_score}, S3M skor={s3m_score}, fark={score_gap}"
+        )
+
+    diode_type = "SK510C" if sk_score < s3m_score else "S3M"
+
+    log_full(f"[INFO] Diyot tipi belirlendi: {diode_type}")
+    log_user(f"Diyot tipi ölçüldü: {diode_type}")
+    return diode_type
+
+def resistor_in_range(measured_ohm: float, nominal_ohm: float, tol: float = RESISTOR_TOLERANCE) -> bool:
+    low = nominal_ohm * (1.0 - tol)
+    high = nominal_ohm * (1.0 + tol)
+    return low <= measured_ohm <= high
+
+def classify_resistor(measured_ohm: float):
+    log_full(f"[CLASSIFY-RES] measured={measured_ohm:.2f} ohm")
+    matches = []
+    for code, nominal in RESISTOR_TARGETS.items():
+        if resistor_in_range(measured_ohm, nominal):
+            matches.append(code)
+
+    if len(matches) == 1:
+        log_full(f"[INFO] Direnç tipi belirlendi: {matches[0]}")
+        log_user(f"Direnç ölçüldü: {matches[0]}")
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(f"Direnç birden fazla tipe uydu: {matches}")
+    raise RuntimeError(f"Direnç değeri hiçbir hedefe uymadı: {measured_ohm:.2f} ohm")
+
+def apply_rotation_xy_offset(x: float, y: float, offset_active: bool):
+    if offset_active:
+        return x + ROTATED_X_OFFSET, y + ROTATED_Y_OFFSET
+    return x, y
+
+# =========================================================
+# KULLANICI MESAJI
+# =========================================================
+def show_user_warning(msg: str):
+    log_user(f"UYARI: {msg}")
+    log_full("\n" + "=" * 60)
+    log_full(f"[KULLANICI UYARISI] {msg}")
+    log_full("=" * 60 + "\n")
+
+# =========================================================
+# YARDIMCI AKIŞLAR
+# =========================================================
+def return_to_pick_and_wait_for_reseat(printer: Printer, arduino: ArduinoActuator,
+                                       px: float, py: float, pz: float,
+                                       offset_active: bool,
+                                       wait_s: float = UNREADABLE_WAIT_S):
+    wait_x, wait_y = apply_rotation_xy_offset(px, py, offset_active)
+
+    log_full("[INFO] Ölçüm okunamadı. Parça vakum açık şekilde pick lokasyonuna geri götürülüyor...")
+    log_user("Ölçüm okunamadı, parça düzeltme için geri götürülüyor.")
+    arduino.pump_force_on()
+
+    printer.go_safe_only()
+    printer.move_xy(wait_x, wait_y)
+    printer.wait_all()
+
+    log_full("[INFO] Z havada tutuluyor, kullanıcı düzeltmesi için aşağı inilmiyor.")
+    arduino.pump_force_on()
+
+    show_user_warning(USER_WARNING_TEXT)
+    log_full(f"[INFO] Kullanıcı müdahalesi için {wait_s:.1f} sn bekleniyor...")
+    time.sleep(wait_s)
+
+    log_full(f"[INFO] Bekleme bitti. Yeniden almak için aşağı iniliyor: Z={pz:.2f}")
+    arduino.pump_force_on()
+    printer.move_z(pz)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+
+    log_full("[INFO] Parça tekrar alınsın diye kısa süre bekleniyor...")
+    time.sleep(PUMP_PICK_WAIT)
+
+    log_full(f"[INFO] Tekrar SAFE yüksekliğine çıkılıyor: Z={SAFE_Z:.2f}")
+    printer.move_z(SAFE_Z)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+
+def drop_back_to_pick_and_release(printer: Printer, arduino: ArduinoActuator,
+                                  px: float, py: float, pz: float,
+                                  offset_active: bool):
+    drop_x, drop_y = apply_rotation_xy_offset(px, py, offset_active)
+
+    log_full("[INFO] Parça pick noktasına geri bırakılıyor...")
+    log_user("Parça geri bırakılıyor.")
+    printer.go_safe_only()
+    printer.move_xy(drop_x, drop_y)
+    printer.wait_all()
+
+    log_full(f"[INFO] Geri bırakmak için aşağı iniliyor: Z={pz:.2f}")
+    printer.move_z(pz)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+
+    arduino.pump_off()
+    time.sleep(RELEASE_WAIT_AFTER_PUMP_OFF)
+
+    printer.move_z(min(pz + 1.5, SAFE_Z))
+    printer.wait_all()
+    time.sleep(RELEASE_LIFT_WAIT)
+
+    printer.move_z(SAFE_Z)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+
+def move_to_diode_test_station(printer: Printer, arduino: ArduinoActuator, offset_active: bool = False):
+    arduino.pump_force_on()
+
+    tx, ty = apply_rotation_xy_offset(DIODE_TEST_X, DIODE_TEST_Y, offset_active)
+    log_full(f"[INFO] Diyot test istasyonuna gidiliyor: X={tx:.2f}, Y={ty:.2f}")
+    log_user("Diyot test istasyonuna gidiliyor.")
+    printer.move_xy(tx, ty)
+    printer.wait_all()
+    time.sleep(AFTER_TEST_XY_WAIT)
+
+    arduino.pump_force_on()
+
+    log_full(f"[INFO] Diyot test istasyonuna iniliyor: Z={DIODE_TEST_Z:.2f}")
+    printer.move_z(DIODE_TEST_Z)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+    time.sleep(TEST_SETTLE_WAIT)
+    time.sleep(AFTER_TEST_READY_WAIT)
+    time.sleep(BEFORE_TEST_WAIT)
+
+def move_to_resistor_test_station(printer: Printer, arduino: ArduinoActuator):
+    arduino.pump_force_on()
+
+    log_full(f"[INFO] Direnç test istasyonuna gidiliyor: X={RES_TEST_X:.2f}, Y={RES_TEST_Y:.2f}")
+    log_user("Direnç test istasyonuna gidiliyor.")
+    printer.move_xy(RES_TEST_X, RES_TEST_Y)
+    printer.wait_all()
+    time.sleep(AFTER_TEST_XY_WAIT)
+
+    arduino.pump_force_on()
+
+    log_full(f"[INFO] Direnç test istasyonuna iniliyor: Z={RES_TEST_Z:.2f}")
+    printer.move_z(RES_TEST_Z)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+    time.sleep(TEST_SETTLE_WAIT)
+    time.sleep(AFTER_TEST_READY_WAIT)
+    time.sleep(BEFORE_TEST_WAIT)
+
+# =========================================================
+# KULLANICI MENÜSÜ
+# =========================================================
+def choose_mode():
+    while True:
+        print("\n=== MOD SEÇİMİ ===")
+        print("1 -> 2 diyot + 2 direnç")
+        print("2 -> 4 direnç")
+        print("q -> çıkış")
+        s = input("Seçim: ").strip().lower()
+        if s in ("1", "2", "q"):
+            return s
+        print("Geçersiz seçim.")
+
+def choose_from_list(prompt, options):
+    while True:
+        print(f"\n{prompt}")
+        for i, item in enumerate(options, start=1):
+            print(f"{i} -> {item}")
+        s = input("Seçim: ").strip()
+        if not s.isdigit():
+            print("Geçersiz seçim.")
+            continue
+        idx = int(s) - 1
+        if 0 <= idx < len(options):
+            return options[idx]
+        print("Geçersiz seçim.")
+
+def get_diode_slot_mapping():
+    print("\n=== DİYOT SLOT EŞLEŞMESİ ===")
+    d1_choice = choose_from_list("D1 slotuna hangi diyot gitsin?", ["S3M", "SK510C"])
+    d2_choice = "SK510C" if d1_choice == "S3M" else "S3M"
+    print(f"D2 slotuna otomatik {d2_choice} atanacak.")
+    return {
+        d1_choice: "D1",
+        d2_choice: "D2",
+    }
+
+def get_resistor_value_to_slot_mapping_mode1():
+    print("\n=== MOD 1 DİRENÇ EŞLEŞMESİ ===")
+    available = ["223", "331", "1001", "332"]
+    mapping = {}
+
+    choice_r1 = choose_from_list("R1 slotuna hangi direnç değeri gitsin?", available)
+    mapping[choice_r1] = "R1"
+    available.remove(choice_r1)
+
+    choice_r2 = choose_from_list("R2 slotuna hangi direnç değeri gitsin?", available)
+    mapping[choice_r2] = "R2"
+    available.remove(choice_r2)
+
+    return mapping
+
+def get_resistor_value_to_slot_mapping_mode2():
+    print("\n=== MOD 2 DİRENÇ EŞLEŞMESİ ===")
+    available = ["223", "331", "1001", "332"]
+    mapping = {}
+
+    for slot in ["D1", "D2", "R1", "R2"]:
+        choice = choose_from_list(f"{slot} slotuna hangi direnç değeri gitsin?", available)
+        mapping[choice] = slot
+        available.remove(choice)
+
+    return mapping
+
+# =========================================================
+# ORTAK BIRAKMA
+# =========================================================
+def place_component(printer: Printer, arduino: ArduinoActuator,
+                    mode: int, slot_name: str, offset_active: bool = False):
+    slot_coords = get_slot_coords(mode)
+    tx, ty, tz = slot_coords[slot_name]
+    tx, ty = apply_rotation_xy_offset(tx, ty, offset_active)
+
+    log_full(f"[INFO] {slot_name} slotuna gidiliyor: X={tx:.2f}, Y={ty:.2f}, Z={tz:.2f} | mode={mode} | offset_active={offset_active}")
+    log_user(f"{slot_name} slotuna yerleştirme yapılıyor.")
+
+    arduino.pump_force_on()
+
+    printer.go_safe_only()
+    printer.move_xy(tx, ty)
+    printer.wait_all()
+    time.sleep(AFTER_SLOT_XY_WAIT)
+
+    arduino.pump_force_on()
+
+    log_full(f"[INFO] Slot yüksekliğine iniliyor: Z={tz:.2f}")
+    printer.move_z(tz)
+    printer.wait_all()
+    time.sleep(AFTER_SLOT_Z_DOWN_WAIT)
+
+    log_full(f"[INFO] Slotta sabit bekleniyor: {SLOT_DWELL_MS_BEFORE_DROP} ms")
+    printer.dwell_ms(SLOT_DWELL_MS_BEFORE_DROP)
+
+    printer.wait_all()
+    printer.flush_rx(PRINTER_FLUSH_BEFORE_DROP_S)
+
+    arduino.pump_off()
+    log_full("[INFO] Vakum kapandı, parçanın ayrılması bekleniyor...")
+    time.sleep(RELEASE_WAIT_AFTER_PUMP_OFF)
+
+    first_lift_z = min(tz + RELEASE_LIFT_Z, SAFE_Z)
+    log_full(f"[INFO] İlk güvenli kalkış: Z={first_lift_z:.2f}")
+    printer.move_z(first_lift_z)
+    printer.wait_all()
+    time.sleep(RELEASE_LIFT_WAIT)
+
+    printer.move_z(SAFE_Z)
+    printer.wait_all()
+    time.sleep(AFTER_Z_MOVE_WAIT)
+
+    log_full("[INFO] Parça bırakma tamamlandı.")
+    log_user(f"{slot_name} slotuna yerleştirme tamamlandı.")
+
+# =========================================================
+# DİYOT İŞLEME
+# =========================================================
+def process_one_diode(printer: Printer, arduino: ArduinoActuator, diode_tester: DiodeTester, pick_tuple, diode_slot_map, mode: int):
+    pick_name, px, py, pz = pick_tuple
+    log_full(f"\n===== DİYOT İŞLENİYOR: {pick_name} =====")
+    log_user(f"{pick_name} alınıyor.")
+
+    did_rotate = False
+    diode_type = None
+    rotation_offset_active = False
+
+    try:
+        printer.go_safe_only()
+        printer.move_xy(px, py)
+        printer.wait_all()
+
+        log_full(f"[INFO] Diyot alma noktasına iniliyor: Z={pz:.2f}")
+        printer.move_z(pz)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        arduino.pump_on()
+
+        log_full(f"[INFO] SAFE'e geri çıkılıyor: Z={SAFE_Z:.2f}")
+        printer.move_z(SAFE_Z)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        unreadable_success = False
+
+        for unreadable_try in range(1, UNREADABLE_RETRY_COUNT + 1):
+            try:
+                log_full(f"\n[INFO] Diyot okuma çevrimi {unreadable_try}/{UNREADABLE_RETRY_COUNT}")
+                log_user(f"{pick_name} test ediliyor. Deneme {unreadable_try}/{UNREADABLE_RETRY_COUNT}")
+
+                printer.go_safe_only()
+                move_to_diode_test_station(printer, arduino, offset_active=rotation_offset_active)
+
+                test = diode_tester.test_with_retry()
+                log_full(f"[DIODE TEST RESULT] {test}")
+
+                if direction_is_correct(test):
+                    log_user("Diyot yönü doğru.")
+                    diode_type = classify_diode(test)
+                    unreadable_success = True
+                    break
+
+                log_full("[INFO] Diyot ters algılandı, SAFE'e çıkılıp çevrilecek.")
+                log_user("Diyot yönü ters algılandı.")
+                printer.move_z(SAFE_Z)
+                printer.wait_all()
+                time.sleep(AFTER_Z_MOVE_WAIT)
+
+                arduino.rotate_fwd_180()
+                did_rotate = True
+                rotation_offset_active = True
+
+                log_full(f"[INFO] Rotate oldu. Offset: X={ROTATED_X_OFFSET}, Y={ROTATED_Y_OFFSET}")
+
+                printer.go_safe_only()
+                move_to_diode_test_station(printer, arduino, offset_active=True)
+
+                test = diode_tester.test_with_retry()
+                log_full(f"[DIODE RETEST RESULT] {test}")
+
+                if not direction_is_correct(test):
+                    raise UnreadableMeasurementError("Döndürmeden sonra da diyot yönü okunamadı/doğrulanamadı")
+
+                log_user("Döndürme sonrası yön doğru.")
+                diode_type = classify_diode(test)
+                unreadable_success = True
+                break
+
+            except Exception as e:
+                log_full(f"[WARN] Diyot ölçümü okunamadı / doğrulanamadı: {e}")
+
+                if did_rotate:
+                    log_full("[INFO] Yeniden deneme öncesi mekanizma eski yönüne alınıyor...")
+                    printer.go_safe_only()
+                    arduino.rotate_back_180()
+                    did_rotate = False
+                    rotation_offset_active = False
+
+                if unreadable_try < UNREADABLE_RETRY_COUNT:
+                    return_to_pick_and_wait_for_reseat(
+                        printer=printer,
+                        arduino=arduino,
+                        px=px,
+                        py=py,
+                        pz=pz,
+                        offset_active=False,
+                        wait_s=UNREADABLE_WAIT_S
+                    )
+                else:
+                    log_full(f"[WARN] Diyot {pick_name} için {UNREADABLE_RETRY_COUNT} denemede de geçerli okuma alınamadı.")
+                    log_user(f"{pick_name} okunamadı, geri bırakılıyor.")
+                    drop_back_to_pick_and_release(
+                        printer=printer,
+                        arduino=arduino,
+                        px=px,
+                        py=py,
+                        pz=pz,
+                        offset_active=False
+                    )
+                    return None
+
+        if not unreadable_success or diode_type is None:
+            log_full(f"[WARN] {pick_name} atlanıyor.")
+            return None
+
+        log_full("[INFO] Test bitti, SAFE'e çıkılıyor.")
+        printer.move_z(SAFE_Z)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        arduino.pump_force_on()
+        target_slot = diode_slot_map[diode_type]
+        log_full(f"[INFO] {diode_type} -> {target_slot}")
+        log_user(f"{diode_type} tipi {target_slot} slotuna gönderiliyor.")
+
+        place_component(printer, arduino, mode, target_slot, offset_active=rotation_offset_active)
+
+    except Exception as e:
+        log_full(f"[DIODE FAIL] {pick_name}: {e}")
+        log_user(f"{pick_name} işlenirken hata oluştu.")
+        try:
+            drop_back_to_pick_and_release(
+                printer=printer,
+                arduino=arduino,
+                px=px,
+                py=py,
+                pz=pz,
+                offset_active=rotation_offset_active
+            )
+        except Exception as drop_err:
+            log_full(f"[WARN] Diyot geri bırakma sırasında hata: {drop_err}")
+        diode_type = None
+
+    finally:
+        if did_rotate:
+            try:
+                printer.go_safe_only()
+                arduino.rotate_back_180()
+            except Exception as rot_err:
+                log_full(f"[WARN] rotate_back_180 hatası: {rot_err}")
+
+    return diode_type
+
+# =========================================================
+# DİRENÇ İŞLEME
+# =========================================================
+def process_one_resistor(printer: Printer, arduino: ArduinoActuator, resistor_tester: ResistorTester,
+                         pick_tuple, resistor_value_to_slot_map, mode: int):
+    pick_name, px, py, pz = pick_tuple
+    log_full(f"\n===== DİRENÇ İŞLENİYOR: {pick_name} =====")
+    log_user(f"{pick_name} alınıyor.")
+
+    identified_code = None
+    target_slot = None
+
+    try:
+        printer.go_safe_only()
+        printer.move_xy(px, py)
+        printer.wait_all()
+
+        log_full(f"[INFO] Direnç alma noktasına iniliyor: Z={pz:.2f}")
+        printer.move_z(pz)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        arduino.pump_on()
+
+        log_full(f"[INFO] SAFE'e geri çıkılıyor: Z={SAFE_Z:.2f}")
+        printer.move_z(SAFE_Z)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        unreadable_success = False
+
+        for unreadable_try in range(1, UNREADABLE_RETRY_COUNT + 1):
+            try:
+                log_full(f"\n[INFO] Direnç okuma çevrimi {unreadable_try}/{UNREADABLE_RETRY_COUNT}")
+                log_user(f"{pick_name} test ediliyor. Deneme {unreadable_try}/{UNREADABLE_RETRY_COUNT}")
+
+                printer.go_safe_only()
+                move_to_resistor_test_station(printer, arduino)
+
+                test = resistor_tester.test_with_retry()
+                measured_ohm = test["ohm"]
+                log_full(f"[RES TEST RESULT] {measured_ohm:.2f} ohm | raw={test['raw']}")
+
+                identified_code = classify_resistor(measured_ohm)
+
+                if identified_code not in resistor_value_to_slot_map:
+                    raise UnreadableMeasurementError(
+                        f"Ölçülen direnç değeri ({identified_code}) kullanıcı eşleşmesinde yok"
+                    )
+
+                target_slot = resistor_value_to_slot_map[identified_code]
+                unreadable_success = True
+                break
+
+            except Exception as e:
+                log_full(f"[WARN] Direnç ölçümü okunamadı / doğrulanamadı: {e}")
+
+                if unreadable_try < UNREADABLE_RETRY_COUNT:
+                    return_to_pick_and_wait_for_reseat(
+                        printer=printer,
+                        arduino=arduino,
+                        px=px,
+                        py=py,
+                        pz=pz,
+                        offset_active=False,
+                        wait_s=UNREADABLE_WAIT_S
+                    )
+                else:
+                    log_full(f"[WARN] Direnç {pick_name} için {UNREADABLE_RETRY_COUNT} denemede de geçerli okuma alınamadı.")
+                    log_user(f"{pick_name} okunamadı, geri bırakılıyor.")
+                    drop_back_to_pick_and_release(
+                        printer=printer,
+                        arduino=arduino,
+                        px=px,
+                        py=py,
+                        pz=pz,
+                        offset_active=False
+                    )
+                    return None, None
+
+        if not unreadable_success or identified_code is None or target_slot is None:
+            log_full(f"[WARN] {pick_name} atlanıyor.")
+            return None, None
+
+        log_full("[INFO] Test bitti, SAFE'e çıkılıyor.")
+        printer.move_z(SAFE_Z)
+        printer.wait_all()
+        time.sleep(AFTER_Z_MOVE_WAIT)
+
+        arduino.pump_force_on()
+        log_full(f"[INFO] Ölçülen değer {identified_code} -> hedef slot {target_slot}")
+        log_user(f"{identified_code} kodlu direnç {target_slot} slotuna gönderiliyor.")
+        place_component(printer, arduino, mode, target_slot, offset_active=False)
+
+    except Exception as e:
+        log_full(f"[RES FAIL] {pick_name}: {e}")
+        log_user(f"{pick_name} işlenirken hata oluştu.")
+        try:
+            drop_back_to_pick_and_release(
+                printer=printer,
+                arduino=arduino,
+                px=px,
+                py=py,
+                pz=pz,
+                offset_active=False
+            )
+        except Exception as drop_err:
+            log_full(f"[WARN] Direnç geri bırakma sırasında hata: {drop_err}")
+        identified_code = None
+        target_slot = None
+
+    return identified_code, target_slot
+
+# =========================================================
+# ANA AKIŞLAR
+# =========================================================
+def run_mode_1(printer, arduino, diode_tester, resistor_tester):
+    log_full("\n######## MOD 1: 2 DİYOT + 2 DİRENÇ ########")
+    diode_slot_map = get_diode_slot_mapping()
+    resistor_value_to_slot_map = get_resistor_value_to_slot_mapping_mode1()
+
+    results = {
+        "diodes": [],
+        "resistors": []
+    }
+
+    for pick in DIODE_PICK_LIST:
+        dtype = process_one_diode(printer, arduino, diode_tester, pick, diode_slot_map, mode=1)
+        results["diodes"].append((pick[0], dtype))
+
+    for pick in RESISTOR_PICK_LIST[:2]:
+        identified_code, slot = process_one_resistor(
+            printer, arduino, resistor_tester,
+            pick_tuple=pick,
+            resistor_value_to_slot_map=resistor_value_to_slot_map,
+            mode=1
+        )
+        results["resistors"].append((pick[0], identified_code, slot))
+
+    return results
+
+def run_mode_2(printer, arduino, resistor_tester):
+    log_full("\n######## MOD 2: 4 DİRENÇ ########")
+    resistor_value_to_slot_map = get_resistor_value_to_slot_mapping_mode2()
+
+    results = {
+        "resistors": []
+    }
+
+    for pick in RESISTOR_PICK_LIST:
+        identified_code, slot = process_one_resistor(
+            printer, arduino, resistor_tester,
+            pick_tuple=pick,
+            resistor_value_to_slot_map=resistor_value_to_slot_map,
+            mode=2
+        )
+        results["resistors"].append((pick[0], identified_code, slot))
+
+    return results
+
+# =========================================================
+# KALİBRASYON MODU OKU
+# =========================================================
+def read_calibration_mode(mode: int):
+    calib_path = get_placement_calib_json(mode)
+
+    if not os.path.exists(calib_path):
+        return None
+
+    with open(calib_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data.get("board_mode")
+
+# =========================================================
+# YERLEŞTİRME DOĞRULAMA ÇAĞIR
+# =========================================================
+def run_placement_verification(mode: int):
+    requested_board_mode = "2d2r" if mode == 1 else "4r"
+    calib_json_path = get_placement_calib_json(mode)
+
+    log_full(f"\n[INFO] Yerleştirme doğrulama başlatılıyor... requested_board_mode={requested_board_mode}")
+    log_user("Yerleştirme doğrulaması başlatılıyor.")
+
+    calib_mode = read_calibration_mode(mode)
+    if calib_mode is None:
+        raise RuntimeError(
+            f"Kalibrasyon dosyası bulunamadı: {calib_json_path}\n"
+            f"Önce şu komutla kalibrasyon yap:\n"
+            f"{PLACEMENT_VERIFIER_PYTHON} {PLACEMENT_VERIFIER_PY} --mode calibrate --board-mode {requested_board_mode}"
+        )
+
+    log_full(f"[INFO] Kalibrasyon dosyasındaki mod: {calib_mode}")
+
+    if calib_mode != requested_board_mode:
+        raise RuntimeError(
+            f"Kalibrasyon modu ile sistem modu farklı.\n"
+            f"- Sistem şu an: {requested_board_mode}\n"
+            f"- Kalibrasyon dosyası: {calib_mode}\n\n"
+            f"Doğru çözüm: mevcut mod için yeniden kalibrasyon yap.\n"
+            f"Örnek komut:\n"
+            f"{PLACEMENT_VERIFIER_PYTHON} {PLACEMENT_VERIFIER_PY} --mode calibrate --board-mode {requested_board_mode}"
+        )
+
+    cmd = [
+        PLACEMENT_VERIFIER_PYTHON,
+        PLACEMENT_VERIFIER_PY,
+        "--mode", "verify",
+        "--board-mode", requested_board_mode,
+        "--auto-capture",
+    ]
+
+    log_full("[VERIFY CMD] " + " ".join(cmd))
+    proc = subprocess.run(cmd)
+    log_full(f"[VERIFY EXIT CODE] {proc.returncode}")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"placement_verifier verify başarısız. exit_code={proc.returncode}")
+
+    if not os.path.exists(PLACEMENT_RESULT_JSON):
+        raise RuntimeError(f"Doğrulama sonucu oluşmadı: {PLACEMENT_RESULT_JSON}")
+
+    with open(PLACEMENT_RESULT_JSON, "r", encoding="utf-8") as f:
+        result = json.load(f)
+
+    log_full("\n=========== YERLEŞTİRME DOĞRULAMA SONUCU ===========")
+    log_full(f"Overall Accuracy: %{result.get('overall_accuracy', 0.0)}")
+    log_user(f"Genel doğruluk: %{result.get('overall_accuracy', 0.0)}")
+
+    slots = result.get("slots", {})
+
+    if mode == 1:
+        slot_order = ["D1", "D2", "R1", "R2"]
+    else:
+        slot_order = ["D1", "D2", "R1", "R2"]
+
+    for slot_name in slot_order:
+        if slot_name in slots:
+            info = slots[slot_name]
+            log_full(
+                f"  - {slot_name}: "
+                f"present={info.get('present')} | "
+                f"status={info.get('status')} | "
+                f"score=%{info.get('score')} | "
+                f"pos_error_px={info.get('pos_error_px')} | "
+                f"angle_error_deg={info.get('angle_error_deg')}"
+            )
+
+    log_full(f"[INFO] Debug görsel: {PLACEMENT_DEBUG_IMG}")
+    log_user("Doğrulama görseli hazır.")
+    return result
+
+# =========================================================
+# SONUÇ YAZDIR
+# =========================================================
+def print_summary(mode, results):
+    log_full("\n================ SONUÇ =================")
+    log_full(f"Mod: {mode}")
+
+    if "diodes" in results:
+        log_full("\n[DİYOTLAR]")
+        for pick_name, dtype in results["diodes"]:
+            log_full(f"  - {pick_name}: {dtype}")
+
+    if "resistors" in results:
+        log_full("\n[DİRENÇLER]")
+        for pick_name, identified, slot in results["resistors"]:
+            log_full(f"  - {pick_name} -> Ölçülen: {identified} | Yerleşen slot: {slot}")
+
+# =========================================================
+# TEK ÇEVRİM ÇALIŞTIR
+# =========================================================
+def run_one_cycle(printer, arduino, diode_tester, resistor_tester, mode_str: str):
+    mode = int(mode_str)
+    results = {"diodes": [], "resistors": []}
+    run_error = None
+
+    log_full("[INFO] Başlangıç güvenliği: önce SAFE noktasına çıkılıyor...")
+    try:
+        printer.go_safe_only()
+    except Exception as e:
+        log_full(f"[WARN] SAFE'e çıkarken hata: {e}")
+
+    try:
+        if mode == 1:
+            results = run_mode_1(printer, arduino, diode_tester, resistor_tester)
+        else:
+            results = run_mode_2(printer, arduino, resistor_tester)
+    except Exception as e:
+        run_error = e
+        log_full(f"[RUN MODE ERROR] {e}")
+
+    log_full("[INFO] Montaj sonrası doğrulama öncesi HOME'a gidilmeye çalışılıyor...")
+    try:
+        printer.go_home()
+    except Exception as e:
+        log_full(f"[WARN] HOME hatası: {e}")
+
+    try:
+        print_summary(mode, results)
+    except Exception as e:
+        log_full(f"[WARN] Summary hatası: {e}")
+
+    log_full("[INFO] Şimdi yerleştirme doğrulaması başlatılacak...")
+    placement_result = run_placement_verification(mode)
+    log_full(f"[INFO] Final overall placement accuracy: %{placement_result.get('overall_accuracy', 0.0)}")
+
+    if run_error is not None:
+        raise RuntimeError(f"Montaj akışında hata vardı ama verify yine çalıştırıldı. Hata: {run_error}")
+
+# =========================================================
+# WEB'DEN ÇALIŞAN ÇEVRİM
+# =========================================================
+def run_one_cycle_web(printer, arduino, diode_tester, resistor_tester, config: dict):
+    mode = int(config["mode"])
+
+    results = {"diodes": [], "resistors": []}
+
+    log_full("[INFO] Başlangıç güvenliği: önce SAFE noktasına çıkılıyor...")
+    try:
+        printer.go_safe_only()
+    except Exception as e:
+        log_full(f"[WARN] SAFE'e çıkarken hata: {e}")
+
+    if mode == 1:
+        diode_slot_map = config["diode_slot_map"]
+        resistor_value_to_slot_map = config["resistor_map_mode1"]
+
+        log_user("Mod 1 başlatıldı: 2 diyot + 2 direnç")
+
+        for pick in DIODE_PICK_LIST:
+            dtype = process_one_diode(printer, arduino, diode_tester, pick, diode_slot_map, mode=1)
+            results["diodes"].append((pick[0], dtype))
+
+        for pick in RESISTOR_PICK_LIST[:2]:
+            identified_code, slot = process_one_resistor(
+                printer, arduino, resistor_tester,
+                pick_tuple=pick,
+                resistor_value_to_slot_map=resistor_value_to_slot_map,
+                mode=1
+            )
+            results["resistors"].append((pick[0], identified_code, slot))
+
+    else:
+        resistor_value_to_slot_map = config["resistor_map_mode2"]
+
+        log_user("Mod 2 başlatıldı: 4 direnç")
+
+        for pick in RESISTOR_PICK_LIST:
+            identified_code, slot = process_one_resistor(
+                printer, arduino, resistor_tester,
+                pick_tuple=pick,
+                resistor_value_to_slot_map=resistor_value_to_slot_map,
+                mode=2
+            )
+            results["resistors"].append((pick[0], identified_code, slot))
+
+    log_full("[INFO] Montaj sonrası HOME'a gidilmeye çalışılıyor...")
+    try:
+        printer.go_home()
+    except Exception as e:
+        log_full(f"[WARN] HOME hatası: {e}")
+
+    print_summary(mode, results)
+    placement_result = run_placement_verification(mode)
+    log_user(f"Yerleştirme doğrulaması tamamlandı. Accuracy = %{placement_result.get('overall_accuracy', 0.0)}")
+
+    return {
+        "mode": mode,
+        "results": results,
+        "placement_result": placement_result
+    }
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    printer_dev = SerialDevice(PRINTER_PORT, PRINTER_BAUD, timeout=0.2)
+    arduino_dev = SerialDevice(ARDUINO_PORT, ARDUINO_BAUD, timeout=1.0)
+    nano_dev    = SerialDevice(NANO_PORT, NANO_BAUD, timeout=1.0)
+
+    try:
+        printer = Printer(printer_dev)
+        arduino = ArduinoActuator(arduino_dev)
+        diode_tester = DiodeTester(nano_dev)
+        resistor_tester = ResistorTester(nano_dev)
+
+        print("Cihazlara bağlanılıyor...")
+        printer.connect()
+        arduino.connect()
+        diode_tester.connect()
+        resistor_tester.connect()
+
+        while True:
+            secim = choose_mode()
+
+            if secim == "q":
+                print("\n[INFO] Kullanıcı çıkış istedi. Sistem kapatılıyor...")
+                try:
+                    printer.go_home()
+                except Exception as e:
+                    print(f"[WARN] Home'a giderken hata: {e}")
+                break
+
+            try:
+                run_one_cycle(printer, arduino, diode_tester, resistor_tester, secim)
+                print("\n[INFO] İşlem tamamlandı. Menüye geri dönülüyor...")
+            except Exception as e:
+                print(f"\n[RUN HATASI] {e}")
+                print("[INFO] Sistem güvenli konuma alınmaya çalışılıyor...")
+                try:
+                    printer.go_safe_only()
+                    printer.go_home()
+                except Exception as home_err:
+                    print(f"[WARN] Güvenli konuma dönüşte hata: {home_err}")
+
+    except KeyboardInterrupt:
+        print("\nKullanıcı durdurdu.")
+    except Exception as e:
+        print(f"\nHATA: {e}")
+    finally:
+        try:
+            printer_dev.close()
+        except Exception:
+            pass
+        try:
+            arduino_dev.close()
+        except Exception:
+            pass
+        try:
+            nano_dev.close()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
