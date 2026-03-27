@@ -1,75 +1,694 @@
 #!/usr/bin/env python3
+import argparse
 import cv2
-import time
+import json
+import math
 import os
+import time
+import numpy as np
 import subprocess
 
-SAVE_DIR = "/home/pi/vision"
-CAM_INDEX = 0
-VIDEO_DEV = "/dev/video0"
+BASE_DIR = "/home/pi/vision"
+
+EMPTY_IMG = os.path.join(BASE_DIR, "empty_pcb.jpg")
+TEST_IMG  = os.path.join(BASE_DIR, "test_pcb.jpg")
+
+OUT_JSON  = os.path.join(BASE_DIR, "placement_result.json")
+OUT_DEBUG = os.path.join(BASE_DIR, "placement_debug.jpg")
+OUT_ALIGN = os.path.join(BASE_DIR, "debug_aligned.jpg")
+
+WEBCAM_INDEX    = 0
+WEBCAM_WARMUP_S = 2.0
+
+TM_METHOD = cv2.TM_CCOEFF_NORMED
+
+GREEN_THRESH  = 75
+YELLOW_THRESH = 55
+
+ROI_W = 72
+ROI_H = 84
+
+MAX_ROT_DEG = 25
+
+DIODE_SEARCH_PAD_X = 24
+DIODE_SEARCH_PAD_Y = 24
+
+RES_SEARCH_PAD_X = 14
+RES_SEARCH_PAD_Y = 14
+
+DIODE_MAX_SHIFT_PX = 26
+RESISTOR_MAX_SHIFT_PX = 32
+
+DIODE_ROT_PENALTY = 0.7
+RESISTOR_ROT_PENALTY = 0.15
+
+USE_ROTATION_FOR_RESISTOR = False
+
+DIODE_TEMPLATE_WEIGHT = 0.75
+DIODE_SHIFT_WEIGHT = 0.25
+
+RES_TEMPLATE_WEIGHT = 0.45
+RES_SHIFT_WEIGHT = 0.55
+
+# =========================================================
+# MISSING / PRESENCE AYARLARI
+# =========================================================
+# Test ROI, empty ROI'ye çok benziyorsa missing say
+EMPTY_NCC_MARGIN = 0.01
+EMPTY_MAD_MARGIN = 2.0
+MIN_EMPTY_DIFF_MAD = 5.0
+MIN_PRESENT_NCC_FIXED = 0.22
+MIN_PRESENT_NCC_SEARCH = 0.22
+
+
+def log(m: str):
+    print("[AOI]", m)
+
+
+def get_perfect_img(board_mode: str) -> str:
+    if board_mode == "2d2r":
+        return os.path.join(BASE_DIR, "perfect_2d2r_pcb.jpg")
+    elif board_mode == "4r":
+        return os.path.join(BASE_DIR, "perfect_4r_pcb.jpg")
+    raise RuntimeError(f"Bilinmeyen board_mode: {board_mode}")
+
 
 def apply_camera_settings():
     cmds = [
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "auto_exposure=1"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "exposure_time_absolute=1200"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "brightness=0"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "contrast=34"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "gain=0"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "white_balance_automatic=0"],
-        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "white_balance_temperature=4000"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "auto_exposure=1"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "exposure_time_absolute=1200"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "brightness=0"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "contrast=34"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "gain=0"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "white_balance_automatic=0"],
+        ["v4l2-ctl", "-d", "/dev/video0", "-c", "white_balance_temperature=4000"],
     ]
 
     for cmd in cmds:
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            print(f"Kamera ayarı uygulanamadı: {e}")
+            log(f"Kamera ayarı uygulanamadı: {e}")
 
-def capture_pcb(file_name):
-    os.makedirs(SAVE_DIR, exist_ok=True)
+
+def get_calib_json(board_mode: str) -> str:
+    if board_mode == "2d2r":
+        return os.path.join(BASE_DIR, "placement_calibration_2d2r.json")
+    elif board_mode == "4r":
+        return os.path.join(BASE_DIR, "placement_calibration_4r.json")
+    raise RuntimeError(f"Bilinmeyen board_mode: {board_mode}")
+
+
+def roi_from_center(cx: int, cy: int, w: int = ROI_W, h: int = ROI_H):
+    x = int(cx - w // 2)
+    y = int(cy - h // 2)
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def get_default_components(board_mode: str):
+    if board_mode == "2d2r":
+        centers = [
+            {"name": "D1", "cx": 500, "cy": 96},
+            {"name": "D2", "cx": 620, "cy": 96},
+            {"name": "R1", "cx": 500, "cy": 278},
+            {"name": "R2", "cx": 620, "cy": 278},
+        ]
+    elif board_mode == "4r":
+        centers = [
+            {"name": "D1", "cx": 500, "cy": 96},
+            {"name": "D2", "cx": 620, "cy": 96},
+            {"name": "R1", "cx": 500, "cy": 278},
+            {"name": "R2", "cx": 620, "cy": 278},
+        ]
+    else:
+        raise RuntimeError(f"Bilinmeyen board_mode: {board_mode}")
+
+    out = []
+    for c in centers:
+        out.append({
+            "name": c["name"],
+            "center": {"cx": c["cx"], "cy": c["cy"]},
+            "roi": roi_from_center(c["cx"], c["cy"])
+        })
+    return out
+
+
+def refresh_component_rois(components):
+    refreshed = []
+    for comp in components:
+        cx = comp["center"]["cx"]
+        cy = comp["center"]["cy"]
+        refreshed.append({
+            "name": comp["name"],
+            "center": {"cx": cx, "cy": cy},
+            "roi": roi_from_center(cx, cy)
+        })
+    return refreshed
+
+
+def get_status_and_color(score: float, present: bool):
+    if not present:
+        return "missing", (0, 0, 255)
+    if score >= GREEN_THRESH:
+        return "good", (0, 255, 0)
+    if score >= YELLOW_THRESH:
+        return "warning", (0, 255, 255)
+    return "bad", (0, 0, 255)
+
+
+def read_img(p: str) -> np.ndarray:
+    im = cv2.imread(p)
+    if im is None:
+        raise RuntimeError("Görüntü okunamadı: " + p)
+    return im
+
+
+def load_json(p: str) -> dict:
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(p: str, d: dict):
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+
+
+def order_pts(pts) -> np.ndarray:
+    pts = np.array(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def warp(img: np.ndarray, corners, w: int, h: int) -> np.ndarray:
+    src = order_pts(corners)
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (w, h))
+
+
+def align_global(ref: np.ndarray, img: np.ndarray) -> np.ndarray:
+    g1 = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    orb = cv2.ORB_create(5000)
+    kp1, des1 = orb.detectAndCompute(g1, None)
+    kp2, des2 = orb.detectAndCompute(g2, None)
+
+    if des1 is None or des2 is None:
+        log("align_global: descriptor yok, hizalama atlandı")
+        return img
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)[:200]
+
+    if len(matches) < 10:
+        log("align_global: yeterli eşleşme yok, hizalama atlandı")
+        return img
+
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+    H, _ = cv2.findHomography(pts2, pts1, cv2.RANSAC, 5)
+    if H is None:
+        log("align_global: homografi hesaplanamadı")
+        return img
+
+    return cv2.warpPerspective(img, H, (ref.shape[1], ref.shape[0]))
+
+
+def rotation_angle_from_image(img_bgr: np.ndarray):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    pts = np.column_stack(np.where(th > 0))
+    if len(pts) < 20:
+        return None
+
+    pts = pts.astype(np.float32)
+    pts -= np.mean(pts, axis=0)
+
+    cov = np.cov(pts, rowvar=False)
+    eigvals, eigvecs = np.linalg.eig(cov)
+    major = eigvecs[:, np.argmax(eigvals)]
+
+    return float(math.degrees(math.atan2(major[0], major[1])))
+
+
+def norm_angle_diff(a, b):
+    if a is None or b is None:
+        return None
+    d = abs(a - b) % 180.0
+    return min(d, 180.0 - d)
+
+
+def capture_test_image(out_path: str = TEST_IMG):
+    log(f"Webcam'den görüntü alınıyor (index={WEBCAM_INDEX})...")
 
     apply_camera_settings()
     time.sleep(0.3)
 
-    cap = cv2.VideoCapture(CAM_INDEX)
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Webcam açılamadı (index={WEBCAM_INDEX})")
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    if not cap.isOpened():
-        print("Hata: Kamera açılamadı!")
-        return
+    t0 = time.time()
+    while time.time() - t0 < WEBCAM_WARMUP_S:
+        cap.read()
 
-    time.sleep(2.0)  # Kameranın sabitlenmesi için bekleme
-
-    # Birkaç kare flush
-    for _ in range(10):
+    for _ in range(8):
         cap.read()
         time.sleep(0.03)
 
     ret, frame = cap.read()
-
-    if ret and frame is not None:
-        file_path = os.path.join(SAVE_DIR, f"{file_name}.jpg")
-        cv2.imwrite(file_path, frame)
-        print(f"Başarıyla kaydedildi: {file_path}")
-    else:
-        print("Hata: Kamera görüntüsü alınamadı!")
-
     cap.release()
 
-step = input(
-    "Hangi resmi çekeceksin? "
-    "(empty / perfect_2d2r / perfect_4r / test): "
-).strip().lower()
+    if not ret or frame is None:
+        raise RuntimeError("Webcam'den kare alınamadı")
 
-file_map = {
-    "empty": "empty_pcb",
-    "perfect_2d2r": "perfect_2d2r_pcb",
-    "perfect_4r": "perfect_4r_pcb",
-    "test": "test_pcb",
-}
+    cv2.imwrite(out_path, frame)
+    log(f"Test görüntüsü kaydedildi: {out_path}")
+    return frame
 
-if step in file_map:
-    capture_pcb(file_map[step])
-else:
-    print("Geçersiz seçenek! Lütfen empty, perfect_2d2r, perfect_4r veya test yazın.")
+
+def clamp_roi(x, y, w, h, W, H):
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = min(w, W - x)
+    h = min(h, H - y)
+    return x, y, w, h
+
+
+def safe_ncc_same_size(img1_gray: np.ndarray, img2_gray: np.ndarray) -> float:
+    if img1_gray.shape != img2_gray.shape:
+        return 0.0
+
+    s1 = float(np.std(img1_gray))
+    s2 = float(np.std(img2_gray))
+
+    if s1 < 1e-6 or s2 < 1e-6:
+        # Çok düz görüntülerde NCC anlamsız olabiliyor
+        mad = np.mean(cv2.absdiff(img1_gray, img2_gray))
+        return float(max(0.0, 1.0 - mad / 255.0))
+
+    val = cv2.matchTemplate(img1_gray, img2_gray, TM_METHOD)[0][0]
+    return float(val)
+
+
+def mean_abs_diff_gray(img1_gray: np.ndarray, img2_gray: np.ndarray) -> float:
+    if img1_gray.shape != img2_gray.shape:
+        return 255.0
+    return float(np.mean(cv2.absdiff(img1_gray, img2_gray)))
+
+
+def decide_presence(p_roi: np.ndarray, e_roi: np.ndarray, t_roi: np.ndarray):
+    p_gray = cv2.cvtColor(p_roi, cv2.COLOR_BGR2GRAY)
+    e_gray = cv2.cvtColor(e_roi, cv2.COLOR_BGR2GRAY)
+    t_gray = cv2.cvtColor(t_roi, cv2.COLOR_BGR2GRAY)
+
+    ncc_perfect = safe_ncc_same_size(t_gray, p_gray)
+    ncc_empty   = safe_ncc_same_size(t_gray, e_gray)
+
+    mad_perfect = mean_abs_diff_gray(t_gray, p_gray)
+    mad_empty   = mean_abs_diff_gray(t_gray, e_gray)
+
+    # perfect ile empty arasında gerçekten hangisine daha yakın?
+    ncc_adv = ncc_perfect - ncc_empty
+    mad_adv = mad_empty - mad_perfect   # pozitifse perfect daha iyi
+
+    present = False
+
+    # 1) perfect, empty'den belirgin daha iyiyse present
+    if ncc_adv > 0.04:
+        present = True
+
+    # 2) absdiff açısından perfect belirgin daha iyiyse present
+    if mad_adv > 6.0:
+        present = True
+
+    # 3) ek güvenlik: perfect NCC çok yüksek değilse bile empty'den yeterince farklıysa present
+    test_empty_diff = mean_abs_diff_gray(t_gray, e_gray)
+    if ncc_perfect > 0.22 and test_empty_diff > 10.0:
+        present = True
+
+    # 4) gerçekten boşsa zorla missing yap
+    if ncc_empty > ncc_perfect and mad_empty < 7.0:
+        present = False
+
+    metrics = {
+        "fixed_ncc_perfect": round(ncc_perfect, 3),
+        "fixed_ncc_empty": round(ncc_empty, 3),
+        "fixed_mad_perfect": round(mad_perfect, 2),
+        "fixed_mad_empty": round(mad_empty, 2),
+        "ncc_adv": round(ncc_adv, 3),
+        "mad_adv": round(mad_adv, 2),
+    }
+    return present, metrics
+
+def run_calibrate(board_mode: str):
+    calib_json = get_calib_json(board_mode)
+    log(f"Kalibrasyon modu: board_mode={board_mode}")
+
+    data = {
+        "board_mode": board_mode,
+        "board_corners": [[0, 0], [1280, 0], [1280, 720], [0, 720]],
+        "warp_size": {"width": 1280, "height": 720},
+        "roi_size": {"w": ROI_W, "h": ROI_H},
+        "components": get_default_components(board_mode)
+    }
+
+    save_json(calib_json, data)
+    log(f"Kalibrasyon kaydedildi: {calib_json}")
+
+
+def run_verify(board_mode: str, auto_capture: bool):
+    calib_json = get_calib_json(board_mode)
+    log(f"Doğrulama modu: board_mode={board_mode}, auto_capture={auto_capture}")
+
+    if not os.path.exists(calib_json):
+        raise RuntimeError(
+            f"Kalibrasyon dosyası yok: {calib_json}\n"
+            f"Önce kalibrasyon çalıştır:\n"
+            f"  python {__file__} --mode calibrate --board-mode {board_mode}"
+        )
+
+    if not os.path.exists(EMPTY_IMG):
+        raise RuntimeError(f"Empty görüntüsü yok: {EMPTY_IMG}")
+
+    perfect_img_path = get_perfect_img(board_mode)
+    if not os.path.exists(perfect_img_path):
+        raise RuntimeError(f"Perfect görüntüsü yok: {perfect_img_path}")
+
+    calib = load_json(calib_json)
+    calib["components"] = refresh_component_rois(calib["components"])
+
+    w = calib["warp_size"]["width"]
+    h = calib["warp_size"]["height"]
+
+    if auto_capture:
+        capture_test_image(TEST_IMG)
+
+    perfect = read_img(perfect_img_path)
+    empty   = read_img(EMPTY_IMG)
+    test    = read_img(TEST_IMG)
+
+    perfect = warp(perfect, calib["board_corners"], w, h)
+    empty   = warp(empty,   calib["board_corners"], w, h)
+    test    = warp(test,    calib["board_corners"], w, h)
+
+    empty = align_global(perfect, empty)
+    test  = align_global(perfect, test)
+
+    cv2.imwrite(OUT_ALIGN, test)
+
+    debug = test.copy()
+    slots = {}
+    scores = []
+
+    H, W = test.shape[:2]
+
+    for comp in calib["components"]:
+        name = comp["name"]
+        r = comp["roi"]
+        x, y, wc, hc = r["x"], r["y"], r["w"], r["h"]
+
+        family = "DIODE" if name in ["D1", "D2"] and board_mode == "2d2r" else "RESISTOR"
+
+        if family == "DIODE":
+            pad_x = DIODE_SEARCH_PAD_X
+            pad_y = DIODE_SEARCH_PAD_Y
+        else:
+            pad_x = RES_SEARCH_PAD_X
+            pad_y = RES_SEARCH_PAD_Y
+
+        sx = x - pad_x
+        sy = y - pad_y
+        sw = wc + 2 * pad_x
+        sh = hc + 2 * pad_y
+        sx, sy, sw, sh = clamp_roi(sx, sy, sw, sh, W, H)
+
+        p_roi = perfect[y:y + hc, x:x + wc]
+        e_roi = empty[y:y + hc, x:x + wc]
+        t_roi_fixed = test[y:y + hc, x:x + wc]
+        search_roi = test[sy:sy + sh, sx:sx + sw]
+
+        if p_roi.size == 0 or e_roi.size == 0 or t_roi_fixed.size == 0 or search_roi.size == 0:
+            status, color = get_status_and_color(0.0, False)
+            slots[name] = {
+                "family": family,
+                "present": False,
+                "score": 0.0,
+                "status": status,
+                "pos_error_px": None,
+                "angle_error_deg": None,
+                "template_score": 0.0,
+                "shift_x": None,
+                "shift_y": None,
+                "fixed_ncc_perfect": None,
+                "fixed_ncc_empty": None,
+                "fixed_mad_perfect": None,
+                "fixed_mad_empty": None,
+                "ok": False,
+            }
+            scores.append(0.0)
+            cv2.rectangle(debug, (x, y), (x + wc, y + hc), color, 2)
+            cv2.putText(debug, f"{name}:ROI_ERR", (x, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            continue
+
+        # =====================================================
+        # 1) ÖNCE SLOT DOLU MU BOŞ MU?
+        # =====================================================
+        present_fixed, presence_metrics = decide_presence(p_roi, e_roi, t_roi_fixed)
+
+        if not present_fixed:
+            status, color = get_status_and_color(0.0, False)
+
+            cv2.rectangle(debug, (x, y), (x + wc, y + hc), color, 2)
+            cv2.putText(
+                debug,
+                f"{name}:MISSING",
+                (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+            slots[name] = {
+                "family": family,
+                "present": False,
+                "score": 0.0,
+                "status": status,
+                "pos_error_px": None,
+                "angle_error_deg": None,
+                "template_score": 0.0,
+                "shift_x": None,
+                "shift_y": None,
+                "fixed_ncc_perfect": presence_metrics["fixed_ncc_perfect"],
+                "fixed_ncc_empty": presence_metrics["fixed_ncc_empty"],
+                "fixed_mad_perfect": presence_metrics["fixed_mad_perfect"],
+                "fixed_mad_empty": presence_metrics["fixed_mad_empty"],
+                "ok": False,
+            }
+            scores.append(0.0)
+            continue
+
+        # =====================================================
+        # 2) DOLUYSA YERLEŞİMİ ARA VE SKORLA
+        # =====================================================
+        p_gray = cv2.cvtColor(p_roi, cv2.COLOR_BGR2GRAY)
+        s_gray = cv2.cvtColor(search_roi, cv2.COLOR_BGR2GRAY)
+
+        res = cv2.matchTemplate(s_gray, p_gray, TM_METHOD)
+        _, maxv, _, maxloc = cv2.minMaxLoc(res)
+
+        best_x = sx + maxloc[0]
+        best_y = sy + maxloc[1]
+
+        matched = test[best_y:best_y + hc, best_x:best_x + wc]
+        if matched.shape[:2] != p_roi.shape[:2]:
+            status, color = get_status_and_color(0.0, False)
+            slots[name] = {
+                "family": family,
+                "present": False,
+                "score": 0.0,
+                "status": status,
+                "pos_error_px": None,
+                "angle_error_deg": None,
+                "template_score": 0.0,
+                "shift_x": None,
+                "shift_y": None,
+                "fixed_ncc_perfect": presence_metrics["fixed_ncc_perfect"],
+                "fixed_ncc_empty": presence_metrics["fixed_ncc_empty"],
+                "fixed_mad_perfect": presence_metrics["fixed_mad_perfect"],
+                "fixed_mad_empty": presence_metrics["fixed_mad_empty"],
+                "ok": False,
+            }
+            scores.append(0.0)
+            continue
+
+        center_ref_x = x + wc / 2.0
+        center_ref_y = y + hc / 2.0
+        center_det_x = best_x + wc / 2.0
+        center_det_y = best_y + hc / 2.0
+
+        dx = center_det_x - center_ref_x
+        dy = center_det_y - center_ref_y
+        shift = float(math.hypot(dx, dy))
+
+        rot_ref = rotation_angle_from_image(p_roi)
+        rot_det = rotation_angle_from_image(matched)
+        rot_err = norm_angle_diff(rot_ref, rot_det)
+
+        present_search = maxv >= MIN_PRESENT_NCC_SEARCH
+        present = bool(present_fixed and present_search)
+
+        if family == "DIODE":
+            max_shift_px = DIODE_MAX_SHIFT_PX
+            use_rotation = True
+        else:
+            max_shift_px = RESISTOR_MAX_SHIFT_PX
+            use_rotation = USE_ROTATION_FOR_RESISTOR
+
+        if family == "DIODE":
+            template_part = maxv * 100.0
+            shift_part = max(0.0, 100.0 - shift * 3.0)
+            score = DIODE_TEMPLATE_WEIGHT * template_part + DIODE_SHIFT_WEIGHT * shift_part
+
+            if use_rotation and rot_err is not None:
+                score -= rot_err * DIODE_ROT_PENALTY
+        else:
+            template_part = maxv * 100.0
+            shift_part = max(0.0, 100.0 - shift * 2.2)
+            score = RES_TEMPLATE_WEIGHT * template_part + RES_SHIFT_WEIGHT * shift_part
+
+            if use_rotation and rot_err is not None:
+                score -= rot_err * RESISTOR_ROT_PENALTY
+
+        score = float(max(0.0, min(100.0, score)))
+
+        if not present:
+            score = 0.0
+
+        if use_rotation:
+            ok = present and shift <= max_shift_px and (rot_err is None or rot_err <= MAX_ROT_DEG)
+        else:
+            ok = present and shift <= max_shift_px
+
+        status, color = get_status_and_color(score, present)
+
+        cv2.rectangle(debug, (x, y), (x + wc, y + hc), color, 2)
+        cv2.rectangle(debug, (best_x, best_y), (best_x + wc, best_y + hc), (255, 255, 0), 2)
+        cv2.putText(
+            debug,
+            f"{name}:{score:.1f}",
+            (x, y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2
+        )
+
+        cv2.circle(debug, (int(center_ref_x), int(center_ref_y)), 4, (0, 255, 0), -1)
+        cv2.circle(debug, (int(center_det_x), int(center_det_y)), 4, (0, 0, 255), -1)
+        cv2.line(
+            debug,
+            (int(center_ref_x), int(center_ref_y)),
+            (int(center_det_x), int(center_det_y)),
+            (255, 255, 0),
+            2
+        )
+
+        slots[name] = {
+            "family": family,
+            "present": bool(present),
+            "score": round(score, 2),
+            "status": status,
+            "pos_error_px": round(shift, 2),
+            "angle_error_deg": round(rot_err, 2) if rot_err is not None else None,
+            "template_score": round(float(maxv), 3),
+            "shift_x": round(dx, 2),
+            "shift_y": round(dy, 2),
+            "fixed_ncc_perfect": presence_metrics["fixed_ncc_perfect"],
+            "fixed_ncc_empty": presence_metrics["fixed_ncc_empty"],
+            "fixed_mad_perfect": presence_metrics["fixed_mad_perfect"],
+            "fixed_mad_empty": presence_metrics["fixed_mad_empty"],
+            "ok": bool(ok),
+        }
+        scores.append(score)
+
+    overall_accuracy = float(round(sum(scores) / len(scores), 2)) if scores else 0.0
+
+    cv2.putText(
+        debug,
+        f"OVERALL:{overall_accuracy:.1f}%",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        3
+    )
+    cv2.imwrite(OUT_DEBUG, debug)
+
+    out = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "board_mode": board_mode,
+        "overall_accuracy": overall_accuracy,
+        "slots": slots,
+    }
+    save_json(OUT_JSON, out)
+
+    log(f"Doğrulama tamamlandı. Overall: %{overall_accuracy}")
+    log(f"Sonuç: {OUT_JSON}")
+    log(f"Debug: {OUT_DEBUG}")
+
+    return out
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="PCB Yerleştirme Doğrulama")
+    parser.add_argument("--mode", choices=["calibrate", "verify"], default="verify")
+    parser.add_argument("--board-mode", default="2d2r", choices=["2d2r", "4r"])
+    parser.add_argument("--auto-capture", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.mode == "calibrate":
+        run_calibrate(args.board_mode)
+    elif args.mode == "verify":
+        result = run_verify(
+            board_mode=args.board_mode,
+            auto_capture=args.auto_capture,
+        )
+
+        print("\n========== SONUÇ ==========")
+        print(f"Overall Accuracy : %{result['overall_accuracy']}")
+
+        for slot_name in ["D1", "D2", "R1", "R2"]:
+            info = result["slots"].get(slot_name)
+            if info:
+                print(
+                    f"  {slot_name}: present={info['present']} | "
+                    f"status={info['status']} | "
+                    f"score=%{info['score']} | "
+                    f"pos_error_px={info['pos_error_px']} | "
+                    f"angle_error_deg={info['angle_error_deg']}"
+                )
+
+
+if __name__ == "__main__":
+    main()
