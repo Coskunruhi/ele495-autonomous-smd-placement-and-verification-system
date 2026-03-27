@@ -1,0 +1,108 @@
+/*
+  28BYJ-48 + ULN2003 (D8-D11) 180 derece
+  Micro air pump (D7) MOSFET low-side switch ile ON/OFF/Toggle
+*/
+
+const int IN1 = 8;
+const int IN2 = 9;
+const int IN3 = 10;
+const int IN4 = 11;
+
+const int PUMP_PIN = 7;     // MOSFET gate
+bool pumpState = false;
+
+// 28BYJ-48 için tipik (half-step): 4096 adım ≈ 360°
+const long STEPS_PER_REV = 4096;
+const long STEPS_180 = STEPS_PER_REV / 2; // 2048 adım
+
+unsigned int stepDelayUs = 2000;
+int seqIndex = 0;
+
+// Half-step dizisi (8 adım) - IN1 IN2 IN3 IN4
+const byte seq[8][4] = {
+  {1,0,0,0},
+  {1,1,0,0},
+  {0,1,0,0},
+  {0,1,1,0},
+  {0,0,1,0},
+  {0,0,1,1},
+  {0,0,0,1},
+  {1,0,0,1}
+};
+
+void applyStep(int idx) {
+  digitalWrite(IN1, seq[idx][0]);
+  digitalWrite(IN2, seq[idx][1]);
+  digitalWrite(IN3, seq[idx][2]);
+  digitalWrite(IN4, seq[idx][3]);
+  delayMicroseconds(stepDelayUs);
+}
+
+void releaseMotor() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void stepOnce(int direction) {
+  seqIndex += direction;
+  if (seqIndex > 7) seqIndex = 0;
+  if (seqIndex < 0) seqIndex = 7;
+  applyStep(seqIndex);
+}
+
+void rotateSteps(long steps, int direction) {
+  for (long i = 0; i < steps; i++) {
+    stepOnce(direction);
+  }
+  releaseMotor();
+}
+
+void setPump(bool on) {
+  pumpState = on;
+  digitalWrite(PUMP_PIN, pumpState ? HIGH : LOW);
+  Serial.print("PUMP=");
+  Serial.println(pumpState ? "ON" : "OFF");
+}
+
+void togglePump() {
+  setPump(!pumpState);
+}
+
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  releaseMotor();
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  Serial.begin(9600);
+  Serial.println("Komutlar: F=180 ileri, B=180 geri, T=Pompa toggle, P=Pompa ON, O=Pompa OFF");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') return;
+
+    if (c == 'F' || c == 'f') {
+      rotateSteps(STEPS_180, +1);
+      Serial.println("OK: 180 ileri");
+    } else if (c == 'B' || c == 'b') {
+      rotateSteps(STEPS_180, -1);
+      Serial.println("OK: 180 geri");
+    } else if (c == 'T' || c == 't') {
+      togglePump();
+    } else if (c == 'P' || c == 'p') {
+      setPump(true);
+    } else if (c == 'O' || c == 'o') {
+      setPump(false);
+    } else {
+      Serial.println("Bilinmeyen komut. F/B/T/P/O kullan.");
+    }
+  }
+}
