@@ -77,7 +77,7 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/ELE495-2526Spring/capstoneproject-resistandplace-grup-3.git
-cd capstoneproject-resistandplace-grup-3
+cd capstoneproject-resistandplace-grup-3```
 
 Upload the required firmware to the related microcontrollers and place the project source files in the appropriate directories.
 
@@ -119,3 +119,27 @@ The system is operated through the web interface.
 ### Demo Video
 
 YouTube playlist: [](https://youtube.com/)
+
+## Project Structure
+
+```text
+README.md
+
+code/
+  main_system/
+  web_ui/
+  vacuum_control/
+  test_station/
+  camera_capture/
+  vision_detection/
+
+media/
+  web_interface.png
+  placement_result.png
+  system_overview.png
+
+docs/
+  Final_Report.pdf
+  Report1.pdf
+  Report2.pdf
+  Final_Poster.pdf
