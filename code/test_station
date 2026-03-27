@@ -1,0 +1,197 @@
+#include <Arduino.h>
+#include <math.h>
+
+// ===============================
+// Arduino Nano pinleri
+// ===============================
+
+// Direnç ölçümü
+#define ADC_RES_PIN   A1
+
+// Diyot yön testi
+#define ADC_DIO_PIN   A0
+#define PIN_A_SIDE    5
+#define PIN_K_SIDE    6
+
+// Nano için ADC referansı
+#define VREF_MV       5000.0
+#define ADC_MAX       1023.0
+
+#define RREF_OHMS     10000.0
+
+// Diyot eşikleri (mV)
+// Bunları test ederek biraz ayarlayabiliriz
+#define DIFF_TH       300
+#define MID_MIN       200
+#define MID_MAX       4500
+
+int read_mv_avg(int pin, int n = 25) {
+  long sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+
+  float adc_avg = (float)sum / n;
+  float mv = (adc_avg * VREF_MV) / ADC_MAX;
+  return (int)mv;
+}
+
+float calcRx(float vnode_mv) {
+  if (vnode_mv < 5 || vnode_mv > (VREF_MV - 5)) return INFINITY;
+  return RREF_OHMS * ((VREF_MV - vnode_mv) / vnode_mv);
+}
+
+bool is_mid(int mv) {
+  return (mv > MID_MIN && mv < MID_MAX);
+}
+
+void drive_dio(int a, int k) {
+  digitalWrite(PIN_A_SIDE, a);
+  digitalWrite(PIN_K_SIDE, k);
+  delay(10);
+}
+
+void hi_z_dio() {
+  digitalWrite(PIN_A_SIDE, LOW);
+  digitalWrite(PIN_K_SIDE, LOW);
+}
+
+void measure_res_once() {
+  const int N = 30;
+  long sum = 0;
+
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(ADC_RES_PIN);
+    delay(2);
+  }
+
+  float adc_avg = (float)sum / N;
+  float vnode_mv = (adc_avg * VREF_MV) / ADC_MAX;
+  float rx = calcRx(vnode_mv);
+
+  Serial.print("R;V=");
+  Serial.print(vnode_mv / 1000.0, 3);
+  Serial.print(";RX=");
+  if (isinf(rx)) {
+    Serial.println("INF");
+  } else {
+    Serial.print(rx, 0);
+    Serial.println();
+  }
+}
+
+void measure_diode_once() {
+  // Nötr
+  hi_z_dio();
+
+  // Test-1: A=HIGH, K=LOW
+  drive_dio(HIGH, LOW);
+  int v1 = read_mv_avg(ADC_DIO_PIN, 25);
+
+  // Test-2: A=LOW, K=HIGH
+  drive_dio(LOW, HIGH);
+  int v2 = read_mv_avg(ADC_DIO_PIN, 25);
+
+  // Nötr
+  hi_z_dio();
+
+  int diff = abs(v1 - v2);
+
+  Serial.print("D;V1=");
+  Serial.print(v1);
+  Serial.print(";V2=");
+  Serial.print(v2);
+  Serial.print(";DIFF=");
+  Serial.print(diff);
+  Serial.print(";RES=");
+
+  if (diff < DIFF_TH) {
+    Serial.println("NO_DIODE_OR_UNSURE");
+    return;
+  }
+
+  bool t1_mid = is_mid(v1);
+  bool t2_mid = is_mid(v2);
+
+  if (t1_mid && !t2_mid) {
+    Serial.println("FWD_TEST1(D5->D6)");
+  } else if (!t1_mid && t2_mid) {
+    Serial.println("FWD_TEST2(D6->D5)");
+  } else {
+    if (v1 > v2) Serial.println("PRESENT(v1>v2)_LIKELY_TEST1");
+    else         Serial.println("PRESENT(v2>v1)_LIKELY_TEST2");
+  }
+}
+
+// ===============================
+// Menü
+// ===============================
+void print_help() {
+  Serial.println("==== MENU ====");
+  Serial.println("r : Resistive measure once (R)");
+  Serial.println("R : Resistive measure continuous (stop with 's')");
+  Serial.println("d : Diode test once (D)");
+  Serial.println("D : Diode test continuous (stop with 's')");
+  Serial.println("a : Both once (R then D)");
+  Serial.println("h : help");
+  Serial.println("s : stop continuous mode");
+  Serial.println("==============");
+}
+
+char mode = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(ADC_RES_PIN, INPUT);
+  pinMode(ADC_DIO_PIN, INPUT);
+
+  pinMode(PIN_A_SIDE, OUTPUT);
+  pinMode(PIN_K_SIDE, OUTPUT);
+  hi_z_dio();
+
+  print_help();
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == 'h') print_help();
+    else if (c == 's') {
+      mode = 0;
+      Serial.println("STOP");
+    }
+    else if (c == 'r') {
+      mode = 0;
+      measure_res_once();
+    }
+    else if (c == 'd') {
+      mode = 0;
+      measure_diode_once();
+    }
+    else if (c == 'a') {
+      mode = 0;
+      measure_res_once();
+      measure_diode_once();
+    }
+    else if (c == 'R') {
+      mode = 'R';
+      Serial.println("RES_CONT");
+    }
+    else if (c == 'D') {
+      mode = 'D';
+      Serial.println("DIO_CONT");
+    }
+  }
+
+  if (mode == 'R') {
+    measure_res_once();
+    delay(300);
+  } else if (mode == 'D') {
+    measure_diode_once();
+    delay(300);
+  }
+}
