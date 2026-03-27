@@ -1,40 +1,121 @@
-# TOBB ETÜ ELE495 - Capstone Project
+# TOBB ETU ELE495 - Capstone Project
+# ResistAndPlace
 
-# Table of Contents
+## Table of Contents
 - [Introduction](#introduction)
 - [Features](#features)
+  - [Hardware](#hardware)
+  - [Operating System and Packages](#operating-system-and-packages)
+  - [Applications](#applications)
+  - [Services](#services)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Screenshots](#screenshots)
+- [Project Structure](#project-structure)
 - [Acknowledgements](#acknowledgements)
+- [Team](#team)
+- [Course](#course)
 
 ## Introduction
-Provide a brief overview of the project, its purpose, and what problem it aims to solve.
+
+ResistAndPlace is an autonomous desktop pick-and-place and testing system developed for the ELE495 Capstone Project at TOBB ETU.
+
+The main goal of this project is to automatically pick SMD components, test them, and place them onto the correct PCB locations. The system combines a 3D-printer-based motion platform, a vacuum pickup mechanism, embedded controllers, a camera-based verification system, and a web-based user interface.
+
+The project is designed to reduce manual placement errors and demonstrate the integration of embedded systems, machine vision, motion control, and automated testing in a single platform.
 
 ## Features
-List the key features and functionalities of the project.
-- Hardware: The hardware components used (should be listed with links)
-- Operating System and packages
-- Applications 
-- Services 
+
+- Automatic pick-and-place of SMD components
+- Vacuum-based component pickup mechanism
+- Resistor value detection
+- Diode polarity and type checking
+- Smart PCB slot-based placement
+- Placement verification using image processing
+- Web-based control panel
+- Real-time system logs and user messages
+- End-of-process placement accuracy reporting
+
+### Hardware
+
+- 3D printer mechanism used as XY-Z motion platform
+- Raspberry Pi
+- Arduino Uno
+- Arduino Nano
+- USB camera
+- Vacuum pump
+- Test PCB
+- Component test circuits for resistor and diode checking
+- Breadboard and interface electronics
+
+### Operating System and Packages
+
+- Raspberry Pi OS
+- Python 3
+- OpenCV
+- Flask
+- PySerial
+- NumPy
+
+### Applications
+
+- Main automation software
+- Web-based user interface
+- Camera capture and image processing modules
+- Component testing and classification modules
+- Placement verification software
+
+### Services
+
+- Local Flask server for the web interface
+- Serial communication between Raspberry Pi and microcontrollers
+- Camera-based image acquisition and verification pipeline
 
 ## Installation
-Describe the steps required to install and set up the project. Include any prerequisites, dependencies, and commands needed to get the project running.
+
+Clone the repository:
 
 ```bash
-# Example commands
-git clone https://github.com/username/project-name.git
-cd project-name
-```
+git clone https://github.com/ELE495-2526Spring/capstoneproject-resistandplace-grup-3.git
+cd capstoneproject-resistandplace-grup-3
+
+Upload the required firmware to the related microcontrollers and place the project source files in the appropriate directories.
 
 ## Usage
-Provide instructions and examples on how to use the project. Include code snippets or screenshots where applicable.
+
+The system is operated through the web interface.
+
+1. Power on the system.
+2. Connect all required hardware modules.
+3. Start the main control software on the Raspberry Pi.
+4. Open the web interface.
+5. Select the operating mode and PCB component configuration.
+6. Start the automated placement cycle.
+7. Monitor the logs, user messages, and placement verification results.
+
+### Example Workflow
+
+1. The system picks a component from the pickup area.
+2. It moves the component to the test station.
+3. The component is identified as a resistor or diode.
+4. Its value or polarity is checked.
+5. If the result matches the requested slot, the component is placed onto the PCB.
+6. At the end of the process, the vision system verifies placement accuracy and reports the overall result.
 
 ## Screenshots
-Include screenshots of the project in action to give a visual representation of its functionality. You can also add videos of running project to YouTube and give a reference to it here. 
 
-## Acknowledgements
-Give credit to those who have contributed to the project or provided inspiration. Include links to any resources or tools used in the project.
+### Web Interface
 
-[Contributor 1](https://github.com/user1)
-[Resource or Tool](https://www.nvidia.com)
+![Web Interface](media/web_interface.png)
+
+### Placement Verification Result
+
+![Placement Result](media/placement_result.png)
+
+### Final System
+
+![Final System](media/system_overview.png)
+
+### Demo Video
+
+YouTube playlist: [](https://youtube.com/)
