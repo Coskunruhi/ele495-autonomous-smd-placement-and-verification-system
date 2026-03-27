@@ -73,14 +73,7 @@ The project is designed to reduce manual placement errors and demonstrate the in
 
 ## Installation
 
-Clone the repository:
-
-```bash
-git clone https://github.com/ELE495-2526Spring/capstoneproject-resistandplace-grup-3.git
-cd capstoneproject-resistandplace-grup-3
-
-```text
-Upload the required firmware to the related microcontrollers and place the project source files in the appropriate directories.
+Project source files, reports, poster, and media are available in this repository for documentation and demonstration purposes.
 
 ## Usage
 
