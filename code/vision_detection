@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import cv2
+import time
+import os
+import subprocess
+
+SAVE_DIR = "/home/pi/vision"
+CAM_INDEX = 0
+VIDEO_DEV = "/dev/video0"
+
+def apply_camera_settings():
+    cmds = [
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "auto_exposure=1"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "exposure_time_absolute=1200"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "brightness=0"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "contrast=34"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "gain=0"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "white_balance_automatic=0"],
+        ["v4l2-ctl", "-d", VIDEO_DEV, "-c", "white_balance_temperature=4000"],
+    ]
+
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"Kamera ayarı uygulanamadı: {e}")
+
+def capture_pcb(file_name):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    apply_camera_settings()
+    time.sleep(0.3)
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    if not cap.isOpened():
+        print("Hata: Kamera açılamadı!")
+        return
+
+    time.sleep(2.0)  # Kameranın sabitlenmesi için bekleme
+
+    # Birkaç kare flush
+    for _ in range(10):
+        cap.read()
+        time.sleep(0.03)
+
+    ret, frame = cap.read()
+
+    if ret and frame is not None:
+        file_path = os.path.join(SAVE_DIR, f"{file_name}.jpg")
+        cv2.imwrite(file_path, frame)
+        print(f"Başarıyla kaydedildi: {file_path}")
+    else:
+        print("Hata: Kamera görüntüsü alınamadı!")
+
+    cap.release()
+
+step = input(
+    "Hangi resmi çekeceksin? "
+    "(empty / perfect_2d2r / perfect_4r / test): "
+).strip().lower()
+
+file_map = {
+    "empty": "empty_pcb",
+    "perfect_2d2r": "perfect_2d2r_pcb",
+    "perfect_4r": "perfect_4r_pcb",
+    "test": "test_pcb",
+}
+
+if step in file_map:
+    capture_pcb(file_map[step])
+else:
+    print("Geçersiz seçenek! Lütfen empty, perfect_2d2r, perfect_4r veya test yazın.")
