@@ -137,7 +137,7 @@ docs/
   Report1.pdf
   Report2.pdf
   Final_Poster.pdf
-```text
+```
 
 ## Acknowledgements
 
