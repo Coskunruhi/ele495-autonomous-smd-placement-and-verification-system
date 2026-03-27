@@ -1,5 +1,5 @@
 # TOBB ETU ELE495 - Capstone Project
-# ResistAndPlace
+# Autonomous SMD Placement and Verification System
 
 ## Table of Contents
 - [Introduction](#introduction)
