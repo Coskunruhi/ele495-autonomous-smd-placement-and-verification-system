@@ -137,3 +137,22 @@ docs/
   Report1.pdf
   Report2.pdf
   Final_Poster.pdf
+```text
+
+## Acknowledgements
+
+We would like to thank our instructors and advisors for their guidance throughout this project.
+
+This project was developed as part of the TOBB ETU ELE495 Capstone Project course.
+
+## Team
+
+- Erkin Coşkun Ruhi
+- Enes Talha Yegin
+- Gaye Erdoğan
+- Arda Cevdet Aslangül
+
+## Course
+
+ELE495 - Capstone Project  
+TOBB University of Economics and Technology
