@@ -1,0 +1,1169 @@
+
+#!/usr/bin/env python3
+from flask import Flask, request, jsonify, send_file, render_template_string
+import threading
+import os
+import traceback
+
+import main_system as ms
+
+app = Flask(__name__)
+
+STATE = {
+    "running": False,
+    "full_logs": [],
+    "user_logs": [],
+    "current_config": None,
+    "result_image_ready": False,
+    "result_summary": None,
+    "popup_open": False
+}
+
+LOCK = threading.Lock()
+
+def add_full_log(msg: str):
+    with LOCK:
+        STATE["full_logs"].append(msg)
+        STATE["full_logs"] = STATE["full_logs"][-800:]
+
+def add_user_log(msg: str):
+    with LOCK:
+        STATE["user_logs"].append(msg)
+        STATE["user_logs"] = STATE["user_logs"][-400:]
+
+def reset_state_for_new_run(config):
+    with LOCK:
+        STATE["running"] = True
+        STATE["full_logs"] = []
+        STATE["user_logs"] = []
+        STATE["current_config"] = config
+        STATE["result_image_ready"] = False
+        STATE["result_summary"] = None
+        STATE["popup_open"] = False
+
+def finish_state(summary=None):
+    with LOCK:
+        STATE["running"] = False
+        STATE["result_summary"] = summary
+        if os.path.exists(ms.PLACEMENT_DEBUG_IMG):
+            STATE["result_image_ready"] = True
+            STATE["popup_open"] = True
+
+def validate_config(config):
+    mode = int(config.get("mode", 0))
+    if mode not in (1, 2):
+        raise RuntimeError("Geçersiz mod.")
+
+    valid_diodes = {"S3M", "SK510C"}
+    valid_resistors = {"223", "331", "1001", "332"}
+
+    if mode == 1:
+        diode_map = config.get("diode_slot_map", {})
+        resistor_map = config.get("resistor_map_mode1", {})
+
+        if set(diode_map.keys()) != valid_diodes:
+            raise RuntimeError("Mod 1 için diyot eşleşmesi eksik ya da hatalı.")
+
+        if set(diode_map.values()) != {"D1", "D2"}:
+            raise RuntimeError("Mod 1 için diyot slotları D1 ve D2 olmalı.")
+
+        if len(resistor_map) != 2:
+            raise RuntimeError("Mod 1 için 2 farklı direnç seçilmelidir.")
+
+        if len(set(resistor_map.keys())) != 2:
+            raise RuntimeError("Mod 1 için direnç değerleri tekrar etmemeli.")
+
+        if not set(resistor_map.keys()).issubset(valid_resistors):
+            raise RuntimeError("Mod 1 için geçersiz direnç kodu var.")
+
+        if set(resistor_map.values()) != {"R1", "R2"}:
+            raise RuntimeError("Mod 1 için direnç slotları R1 ve R2 olmalı.")
+
+    elif mode == 2:
+        resistor_map = config.get("resistor_map_mode2", {})
+
+        if len(resistor_map) != 4:
+            raise RuntimeError("Mod 2 için 4 farklı direnç seçilmelidir.")
+
+        if set(resistor_map.keys()) != valid_resistors:
+            raise RuntimeError("Mod 2 için tüm direnç kodları birer kez seçilmeli.")
+
+        if set(resistor_map.values()) != {"D1", "D2", "R1", "R2"}:
+            raise RuntimeError("Mod 2 için slotlar D1, D2, R1, R2 olmalı.")
+
+def run_cycle_background(config):
+    printer_dev = ms.SerialDevice(ms.PRINTER_PORT, ms.PRINTER_BAUD, timeout=0.2)
+    arduino_dev = ms.SerialDevice(ms.ARDUINO_PORT, ms.ARDUINO_BAUD, timeout=1.0)
+    nano_dev    = ms.SerialDevice(ms.NANO_PORT, ms.NANO_BAUD, timeout=1.0)
+
+    try:
+        ms.set_log_callbacks(add_full_log, add_user_log)
+
+        printer = ms.Printer(printer_dev)
+        arduino = ms.ArduinoActuator(arduino_dev)
+        diode_tester = ms.DiodeTester(nano_dev)
+        resistor_tester = ms.ResistorTester(nano_dev)
+
+        add_user_log("Cihazlara bağlanılıyor...")
+        printer.connect()
+        arduino.connect()
+        diode_tester.connect()
+        resistor_tester.connect()
+
+        add_user_log("Sistem başlatıldı.")
+        result = ms.run_one_cycle_web(
+            printer=printer,
+            arduino=arduino,
+            diode_tester=diode_tester,
+            resistor_tester=resistor_tester,
+            config=config
+        )
+
+        add_user_log("İşlem tamamlandı.")
+        finish_state(summary=result)
+
+    except Exception as e:
+        add_full_log(f"[WEB RUN ERROR] {e}")
+        add_full_log(traceback.format_exc())
+        add_user_log(f"Hata oluştu: {e}")
+
+        try:
+            printer = ms.Printer(printer_dev)
+            printer.go_safe_only()
+            printer.go_home()
+        except Exception:
+            pass
+
+        finish_state(summary={"error": str(e)})
+
+    finally:
+        try:
+            printer_dev.close()
+        except Exception:
+            pass
+        try:
+            arduino_dev.close()
+        except Exception:
+            pass
+        try:
+            nano_dev.close()
+        except Exception:
+            pass
+
+HTML_PAGE = """
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>ELE495 Web Arayüz</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a2f;
+      --card: #0f172a;
+      --border: rgba(255,255,255,0.08);
+      --text: #e5e7eb;
+      --slot-border: #334155;
+      --glow: 0 10px 30px rgba(0,0,0,0.35);
+      --radius: 18px;
+      --blue: #60a5fa;
+      --green: #4ade80;
+      --yellow: #fbbf24;
+      --red: #ef4444;
+      --userbg: #111a2e;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Inter, "Segoe UI", Arial, sans-serif;
+      background:
+        radial-gradient(circle at top left, #16213e 0%, #0b1020 45%),
+        linear-gradient(135deg, #0b1020, #111827);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .container {
+      display: flex;
+      gap: 14px;
+      height: 100vh;
+      padding: 14px;
+    }
+
+    .left {
+      width: 31%;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .right {
+      width: 69%;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .box {
+      background: rgba(18, 26, 47, 0.92);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: var(--glow);
+      backdrop-filter: blur(8px);
+      min-width: 0;
+    }
+
+    h2, h3 {
+      margin-top: 0;
+      margin-bottom: 14px;
+      color: #f8fafc;
+      letter-spacing: 0.2px;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .mini-btn {
+      margin: 0;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 15px;
+      font-weight: 700;
+      color: white;
+      background: linear-gradient(135deg, #334155, #1e293b);
+      box-shadow: none;
+    }
+
+    .mini-btn:hover {
+      filter: brightness(1.08);
+    }
+
+    .controls label {
+      display: block;
+      margin-top: 12px;
+      margin-bottom: 6px;
+      font-weight: bold;
+      color: #dbeafe;
+    }
+
+    .controls select {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid #334155;
+      background: #0f172a;
+      color: #f8fafc;
+      font-size: 16px;
+      outline: none;
+    }
+
+    .controls select:focus {
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 3px rgba(96,165,250,0.15);
+    }
+
+    button {
+      padding: 13px 18px;
+      border: none;
+      background: linear-gradient(135deg, #2563eb, #3b82f6);
+      color: white;
+      border-radius: 14px;
+      cursor: pointer;
+      margin-top: 16px;
+      font-size: 16px;
+      font-weight: bold;
+      box-shadow: 0 8px 20px rgba(37,99,235,0.35);
+    }
+
+    button:hover { filter: brightness(1.05); }
+
+    button:disabled {
+      background: #475569;
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+
+    .statusline {
+      margin-top: 12px;
+      font-weight: bold;
+      font-size: 19px;
+      color: #cbd5e1;
+    }
+
+    .status-running { color: var(--green); }
+    .status-idle { color: var(--yellow); }
+
+    .mode-warning {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(251,191,36,0.12);
+      border: 1px solid rgba(251,191,36,0.32);
+      color: #fde68a;
+      font-size: 14px;
+      line-height: 1.45;
+      font-weight: 600;
+    }
+
+    .pcb-box {
+      height: 52%;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .pcb-panel {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      border-radius: 22px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background:
+        linear-gradient(180deg, rgba(30,41,59,0.95), rgba(15,23,42,0.96)),
+        linear-gradient(135deg, #0f172a, #1e293b);
+      min-height: 360px;
+    }
+
+    .pcb-grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+      background-size: 30px 30px;
+      opacity: 0.35;
+      pointer-events: none;
+    }
+
+    .pcb-title {
+      position: absolute;
+      top: 18px;
+      left: 22px;
+      font-size: 28px;
+      font-weight: bold;
+      color: #cbd5e1;
+      letter-spacing: 1px;
+    }
+
+    .trace {
+      position: absolute;
+      background: linear-gradient(90deg, rgba(34,197,94,0.22), rgba(96,165,250,0.22));
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.04);
+    }
+
+    .slot {
+      position: absolute;
+      width: 150px;
+      min-height: 82px;
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, rgba(30,41,59,0.96), rgba(15,23,42,0.98));
+      border: 1px solid var(--slot-border);
+      box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,0.03),
+        0 10px 25px rgba(0,0,0,0.28);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .slot-name {
+      font-size: 20px;
+      font-weight: bold;
+      color: #93c5fd;
+      margin-bottom: 6px;
+    }
+
+    .slot-value {
+      font-size: 20px;
+      font-weight: bold;
+      color: #f8fafc;
+      text-align: center;
+      word-break: break-word;
+    }
+
+    .slot.hint .slot-value {
+      color: #64748b;
+      font-weight: 600;
+    }
+
+    .slot.active {
+      border-color: rgba(96,165,250,0.55);
+      box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,0.03),
+        0 0 0 1px rgba(96,165,250,0.18),
+        0 10px 30px rgba(37,99,235,0.24);
+    }
+
+    .slot.diode {
+      background:
+        linear-gradient(180deg, rgba(36, 52, 77, 0.98), rgba(15, 23, 42, 0.98));
+    }
+
+    .slot.resistor {
+      background:
+        linear-gradient(180deg, rgba(42, 47, 74, 0.98), rgba(15, 23, 42, 0.98));
+    }
+
+    .bottom-row {
+      display: flex;
+      gap: 14px;
+      height: 48%;
+    }
+
+    .half {
+      width: 50%;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .userlogs {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--userbg);
+      border-radius: 14px;
+      padding: 10px;
+      border: 1px solid #263244;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+
+    .user-msg {
+      background: linear-gradient(180deg, rgba(23,35,61,0.96), rgba(15,23,42,0.96));
+      border: 1px solid rgba(96,165,250,0.12);
+      color: #e2e8f0;
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+      word-break: break-word;
+    }
+
+    .user-msg:last-child {
+      margin-bottom: 0;
+    }
+
+    .logs {
+      flex: 1;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      background: #020617;
+      color: #4ade80;
+      font-family: "Cascadia Code", Consolas, monospace;
+      border-radius: 14px;
+      padding: 12px;
+      border: 1px solid #1e293b;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .summary {
+      background: #0f172a;
+      border: 1px solid #263244;
+      padding: 10px;
+      border-radius: 12px;
+      margin-top: 10px;
+      white-space: pre-wrap;
+      max-height: 140px;
+      overflow-y: auto;
+      color: #cbd5e1;
+      font-size: 14px;
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 9999;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(2,6,23,0.35);
+      justify-content: center;
+      align-items: flex-start;
+      padding-top: 36px;
+    }
+
+    .modal-content {
+      background: #0f172a;
+      padding: 16px;
+      border-radius: 18px;
+      width: 78%;
+      max-width: 1200px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .modal-content h3 {
+      margin: 0;
+      font-size: 28px;
+      color: #f8fafc;
+    }
+
+    .modal-content img {
+      width: 100%;
+      max-height: 70vh;
+      object-fit: contain;
+      display: block;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: #020617;
+    }
+
+    .close-btn {
+      margin-top: 0;
+      padding: 8px 14px;
+      border-radius: 12px;
+      border: none;
+      cursor: pointer;
+      font-size: 20px;
+      font-weight: bold;
+      background: linear-gradient(135deg, #ef4444, #dc2626);
+      color: white;
+      box-shadow: 0 8px 18px rgba(239,68,68,0.28);
+    }
+
+    .close-btn:hover { filter: brightness(1.08); }
+
+    .panel-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9998;
+      background: rgba(2,6,23,0.55);
+      justify-content: center;
+      align-items: center;
+      padding: 22px;
+    }
+
+    .panel-overlay-content {
+      width: min(1200px, 95vw);
+      height: min(82vh, 900px);
+      background: #0f172a;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+    }
+
+    .panel-overlay-body {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+
+    .panel-overlay .userlogs,
+    .panel-overlay .logs {
+      height: 100%;
+      flex: 1;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <div class="left">
+    <div class="box">
+      <h2>Kontrol Paneli</h2>
+
+      <div class="controls">
+        <label>Mod</label>
+        <select id="mode" onchange="updateModeFields()">
+          <option value="1">1 - 2 diyot + 2 direnç</option>
+          <option value="2">2 - 4 direnç</option>
+        </select>
+
+        <div id="mode1-fields">
+          <label>D1 slotuna gidecek diyot</label>
+          <select id="d1_diode" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="S3M">S3M</option>
+            <option value="SK510C">SK510C</option>
+          </select>
+
+          <label>R1 slotuna gidecek direnç</label>
+          <select id="r1_res" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+
+          <label>R2 slotuna gidecek direnç</label>
+          <select id="r2_res" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+
+          <div id="mode1-warning" class="mode-warning">
+            Lütfen seçtiğiniz dirençler Rp1 ve Rp2 yerine yerleştirin!
+          </div>
+        </div>
+
+        <div id="mode2-fields" style="display:none;">
+          <label>D1 slotuna gidecek direnç</label>
+          <select id="m2_d1" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+
+          <label>D2 slotuna gidecek direnç</label>
+          <select id="m2_d2" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+
+          <label>R1 slotuna gidecek direnç</label>
+          <select id="m2_r1" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+
+          <label>R2 slotuna gidecek direnç</label>
+          <select id="m2_r2" onchange="updatePcbLabels()">
+            <option value="">None</option>
+            <option value="223">223</option>
+            <option value="331">331</option>
+            <option value="1001">1001</option>
+            <option value="332">332</option>
+          </select>
+        </div>
+
+        <button id="startBtn" onclick="startSystem()">Sistemi Başlat</button>
+        <div class="statusline" id="runState">Durum: Beklemede</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="box pcb-box">
+      <h2>PCB Yerleşim Paneli</h2>
+      <div class="pcb-panel">
+        <div class="pcb-grid"></div>
+        <div class="pcb-title">PCB LAYOUT</div>
+
+        <div class="trace" style="left: 31%; top: 33%; width: 38%; height: 8px;"></div>
+        <div class="trace" style="left: 31%; top: 63%; width: 38%; height: 8px;"></div>
+        <div class="trace" style="left: 28%; top: 36%; width: 8px; height: 110px;"></div>
+        <div class="trace" style="left: 69%; top: 36%; width: 8px; height: 110px;"></div>
+
+        <div id="slot_D1" class="slot diode hint" style="left: 18%; top: 22%;">
+          <div class="slot-name">D1</div>
+          <div class="slot-value">Seçim yok</div>
+        </div>
+
+        <div id="slot_D2" class="slot diode hint" style="left: 18%; top: 54%;">
+          <div class="slot-name">D2</div>
+          <div class="slot-value">Seçim yok</div>
+        </div>
+
+        <div id="slot_R1" class="slot resistor hint" style="left: 63%; top: 22%;">
+          <div class="slot-name">R1</div>
+          <div class="slot-value">Seçim yok</div>
+        </div>
+
+        <div id="slot_R2" class="slot resistor hint" style="left: 63%; top: 54%;">
+          <div class="slot-name">R2</div>
+          <div class="slot-value">Seçim yok</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bottom-row">
+      <div class="box half">
+        <div class="panel-header">
+          <h2 style="margin:0;">Kullanıcı Mesajları</h2>
+          <button class="mini-btn" onclick="openPanelOverlay('user')">⤢</button>
+        </div>
+        <div id="userlogs" class="userlogs"></div>
+        <div id="summaryBox" class="summary"></div>
+      </div>
+
+      <div class="box half">
+        <div class="panel-header">
+          <h2 style="margin:0;">Tüm Loglar</h2>
+          <button class="mini-btn" onclick="openPanelOverlay('log')">⤢</button>
+        </div>
+        <div id="fulllogs" class="logs"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="imgModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Yerleştirme Sonucu</h3>
+      <button class="close-btn" onclick="closePopup()">✕</button>
+    </div>
+    <img id="resultImg" src="/debug-image?ts=0" alt="debug image">
+  </div>
+</div>
+
+<div id="panelOverlay" class="panel-overlay">
+  <div class="panel-overlay-content">
+    <div class="modal-header">
+      <h3 id="overlayTitle">Panel</h3>
+      <button class="close-btn" onclick="closePanelOverlay()">✕</button>
+    </div>
+    <div class="panel-overlay-body" id="overlayBody"></div>
+  </div>
+</div>
+
+<script>
+const ALL_RES = ["223", "331", "1001", "332"];
+let prevRunning = false;
+let overlayMode = null;
+
+function setOptions(selectId, values) {
+  const el = document.getElementById(selectId);
+  const current = el.value;
+  el.innerHTML = "";
+
+  const noneOpt = document.createElement("option");
+  noneOpt.value = "";
+  noneOpt.textContent = "None";
+  el.appendChild(noneOpt);
+
+  values.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    el.appendChild(opt);
+  });
+
+  if (["", ...values].includes(current)) {
+    el.value = current;
+  } else {
+    el.value = "";
+  }
+}
+
+function renderUserMessages(messages, targetEl) {
+  targetEl.innerHTML = "";
+  messages.forEach(msg => {
+    const div = document.createElement("div");
+    div.className = "user-msg";
+    div.textContent = msg;
+    targetEl.appendChild(div);
+  });
+}
+
+function setSlot(slotId, valueText) {
+  const slot = document.getElementById(slotId);
+  const valueDiv = slot.querySelector(".slot-value");
+
+  if (!valueText) {
+    valueDiv.innerText = "Seçim yok";
+    slot.classList.add("hint");
+    slot.classList.remove("active");
+    return;
+  }
+
+  valueDiv.innerText = valueText;
+  slot.classList.remove("hint");
+  slot.classList.add("active");
+}
+
+function resetFormToDefault() {
+  document.getElementById("mode").value = "1";
+
+  document.getElementById("d1_diode").value = "";
+  document.getElementById("r1_res").value = "";
+  document.getElementById("r2_res").value = "";
+
+  document.getElementById("m2_d1").value = "";
+  document.getElementById("m2_d2").value = "";
+  document.getElementById("m2_r1").value = "";
+  document.getElementById("m2_r2").value = "";
+
+  updateModeFields();
+
+  setSlot("slot_D1", "");
+  setSlot("slot_D2", "");
+  setSlot("slot_R1", "");
+  setSlot("slot_R2", "");
+}
+
+function syncUniqueMode1() {
+  const r1 = document.getElementById("r1_res").value;
+  const r2 = document.getElementById("r2_res").value;
+
+  setOptions("r1_res", ALL_RES.filter(v => v !== r2 || r1 === v));
+  setOptions("r2_res", ALL_RES.filter(v => v !== r1 || r2 === v));
+
+  document.getElementById("r1_res").value = r1 && (r1 !== r2 || r2 === "") ? r1 : (r1 === r2 ? "" : r1);
+  document.getElementById("r2_res").value = r2 && (r2 !== r1 || r1 === "") ? r2 : (r1 === r2 ? "" : r2);
+}
+
+function syncUniqueMode2() {
+  const ids = ["m2_d1", "m2_d2", "m2_r1", "m2_r2"];
+  const selected = {};
+  ids.forEach(id => selected[id] = document.getElementById(id).value);
+
+  ids.forEach(id => {
+    const usedByOthers = ids
+      .filter(other => other !== id)
+      .map(other => selected[other])
+      .filter(v => v !== "");
+
+    const current = selected[id];
+    const allowed = ALL_RES.filter(v => !usedByOthers.includes(v) || v === current);
+
+    setOptions(id, allowed);
+
+    if (current && allowed.includes(current)) {
+      document.getElementById(id).value = current;
+    } else {
+      document.getElementById(id).value = "";
+    }
+  });
+}
+
+function updateModeFields() {
+  const mode = document.getElementById("mode").value;
+  document.getElementById("mode1-fields").style.display = mode === "1" ? "block" : "none";
+  document.getElementById("mode2-fields").style.display = mode === "2" ? "block" : "none";
+
+  const mode1Warning = document.getElementById("mode1-warning");
+  if (mode1Warning) {
+    mode1Warning.style.display = mode === "1" ? "block" : "none";
+  }
+
+  if (mode === "1") {
+    syncUniqueMode1();
+  } else {
+    syncUniqueMode2();
+  }
+
+  updatePcbLabels();
+}
+
+function updatePcbLabels() {
+  const mode = document.getElementById("mode").value;
+
+  if (mode === "1") {
+    syncUniqueMode1();
+
+    const d1 = document.getElementById("d1_diode").value;
+    const d2 = d1 === "S3M" ? "SK510C" : (d1 === "SK510C" ? "S3M" : "");
+    const r1 = document.getElementById("r1_res").value;
+    const r2 = document.getElementById("r2_res").value;
+
+    setSlot("slot_D1", d1);
+    setSlot("slot_D2", d2);
+    setSlot("slot_R1", r1);
+    setSlot("slot_R2", r2);
+  } else {
+    syncUniqueMode2();
+
+    setSlot("slot_D1", document.getElementById("m2_d1").value);
+    setSlot("slot_D2", document.getElementById("m2_d2").value);
+    setSlot("slot_R1", document.getElementById("m2_r1").value);
+    setSlot("slot_R2", document.getElementById("m2_r2").value);
+  }
+}
+
+function validateBeforeStart() {
+  const mode = document.getElementById("mode").value;
+
+  if (mode === "1") {
+    const d1 = document.getElementById("d1_diode").value;
+    const r1 = document.getElementById("r1_res").value;
+    const r2 = document.getElementById("r2_res").value;
+
+    if (!d1 || !r1 || !r2) {
+      alert("Mod 1 için tüm seçimleri yapmalısın.");
+      return false;
+    }
+
+    if (r1 === r2) {
+      alert("Aynı direnç değeri iki slotta seçilemez.");
+      return false;
+    }
+  } else {
+    const vals = [
+      document.getElementById("m2_d1").value,
+      document.getElementById("m2_d2").value,
+      document.getElementById("m2_r1").value,
+      document.getElementById("m2_r2").value
+    ];
+
+    if (vals.some(v => !v)) {
+      alert("Mod 2 için dört slotun da seçilmesi gerekiyor.");
+      return false;
+    }
+
+    const uniqueVals = new Set(vals);
+    if (uniqueVals.size !== 4) {
+      alert("Mod 2 için aynı direnç değeri tekrar seçilemez.");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+async function startSystem() {
+  if (!validateBeforeStart()) {
+    return;
+  }
+
+  const mode = document.getElementById("mode").value;
+  let payload = { mode: mode };
+
+  if (mode === "1") {
+    const d1 = document.getElementById("d1_diode").value;
+    const d2 = d1 === "S3M" ? "SK510C" : "S3M";
+
+    payload.diode_slot_map = {};
+    payload.diode_slot_map[d1] = "D1";
+    payload.diode_slot_map[d2] = "D2";
+
+    payload.resistor_map_mode1 = {
+      [document.getElementById("r1_res").value]: "R1",
+      [document.getElementById("r2_res").value]: "R2"
+    };
+  } else {
+    payload.resistor_map_mode2 = {
+      [document.getElementById("m2_d1").value]: "D1",
+      [document.getElementById("m2_d2").value]: "D2",
+      [document.getElementById("m2_r1").value]: "R1",
+      [document.getElementById("m2_r2").value]: "R2"
+    };
+  }
+
+  const res = await fetch("/start", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  alert(data.message);
+}
+
+async function closePopup() {
+  document.getElementById("imgModal").style.display = "none";
+  try {
+    await fetch("/close-popup", { method: "POST" });
+  } catch (e) {
+    console.error("Popup kapatma hatası:", e);
+  }
+}
+
+function openPanelOverlay(type) {
+  overlayMode = type;
+  const overlay = document.getElementById("panelOverlay");
+  const body = document.getElementById("overlayBody");
+  const title = document.getElementById("overlayTitle");
+
+  body.innerHTML = "";
+
+  if (type === "user") {
+    title.textContent = "Kullanıcı Mesajları";
+    const div = document.createElement("div");
+    div.className = "userlogs";
+    div.id = "overlayUserLogs";
+    body.appendChild(div);
+  } else {
+    title.textContent = "Tüm Loglar";
+    const div = document.createElement("div");
+    div.className = "logs";
+    div.id = "overlayFullLogs";
+    body.appendChild(div);
+  }
+
+  overlay.style.display = "flex";
+}
+
+function closePanelOverlay() {
+  document.getElementById("panelOverlay").style.display = "none";
+  document.getElementById("overlayBody").innerHTML = "";
+  overlayMode = null;
+}
+
+async function pollStatus() {
+  const res = await fetch("/status");
+  const data = await res.json();
+
+  document.getElementById("fulllogs").innerText = data.full_logs.join("\\n");
+  renderUserMessages(data.user_logs, document.getElementById("userlogs"));
+
+  const full = document.getElementById("fulllogs");
+  full.scrollTop = full.scrollHeight;
+
+  const user = document.getElementById("userlogs");
+  user.scrollTop = user.scrollHeight;
+
+  if (overlayMode === "user") {
+    const overlayUser = document.getElementById("overlayUserLogs");
+    if (overlayUser) {
+      renderUserMessages(data.user_logs, overlayUser);
+      overlayUser.scrollTop = overlayUser.scrollHeight;
+    }
+  }
+
+  if (overlayMode === "log") {
+    const overlayFull = document.getElementById("overlayFullLogs");
+    if (overlayFull) {
+      overlayFull.innerText = data.full_logs.join("\\n");
+      overlayFull.scrollTop = overlayFull.scrollHeight;
+    }
+  }
+
+  const runState = document.getElementById("runState");
+  if (data.running) {
+    runState.innerText = "Durum: Çalışıyor";
+    runState.className = "statusline status-running";
+  } else {
+    runState.innerText = "Durum: Beklemede";
+    runState.className = "statusline status-idle";
+  }
+
+  document.getElementById("startBtn").disabled = data.running;
+
+  if (data.result_summary) {
+    document.getElementById("summaryBox").innerText = JSON.stringify(data.result_summary, null, 2);
+  } else {
+    document.getElementById("summaryBox").innerText = "";
+  }
+
+  if (data.popup_open) {
+    document.getElementById("imgModal").style.display = "flex";
+    document.getElementById("resultImg").src = "/debug-image?ts=" + Date.now();
+  }
+
+  if (prevRunning === true && data.running === false) {
+    resetFormToDefault();
+  }
+
+  prevRunning = data.running;
+
+  setTimeout(pollStatus, 1000);
+}
+
+document.addEventListener("change", function() {
+  updatePcbLabels();
+});
+
+document.addEventListener("keydown", function(e) {
+  const modal = document.getElementById("imgModal");
+  const overlay = document.getElementById("panelOverlay");
+
+  if (e.key === "Escape") {
+    if (modal.style.display === "flex") {
+      closePopup();
+      return;
+    }
+    if (overlay.style.display === "flex") {
+      closePanelOverlay();
+    }
+  }
+});
+
+window.addEventListener("click", function(e) {
+  const modal = document.getElementById("imgModal");
+  const overlay = document.getElementById("panelOverlay");
+
+  if (e.target === modal) {
+    closePopup();
+  }
+  if (e.target === overlay) {
+    closePanelOverlay();
+  }
+});
+
+updateModeFields();
+pollStatus();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route("/start", methods=["POST"])
+def start():
+    data = request.get_json(force=True)
+
+    with LOCK:
+        if STATE["running"]:
+            return jsonify({"ok": False, "message": "Sistem zaten çalışıyor."})
+
+    try:
+        validate_config(data)
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Konfigürasyon hatası: {e}"})
+
+    reset_state_for_new_run(data)
+    t = threading.Thread(target=run_cycle_background, args=(data,), daemon=True)
+    t.start()
+
+    return jsonify({"ok": True, "message": "Sistem başlatıldı."})
+
+@app.route("/status")
+def status():
+    with LOCK:
+        return jsonify({
+            "running": STATE["running"],
+            "full_logs": STATE["full_logs"],
+            "user_logs": STATE["user_logs"],
+            "popup_open": STATE["popup_open"],
+            "result_image_ready": STATE["result_image_ready"],
+            "result_summary": STATE["result_summary"],
+            "current_config": STATE["current_config"]
+        })
+
+@app.route("/debug-image")
+def debug_image():
+    if os.path.exists(ms.PLACEMENT_DEBUG_IMG):
+        return send_file(ms.PLACEMENT_DEBUG_IMG)
+    return "Resim yok", 404
+
+@app.route("/close-popup", methods=["POST"])
+def close_popup():
+    with LOCK:
+        STATE["popup_open"] = False
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
