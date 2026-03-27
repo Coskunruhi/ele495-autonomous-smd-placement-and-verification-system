@@ -77,8 +77,9 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/ELE495-2526Spring/capstoneproject-resistandplace-grup-3.git
-cd capstoneproject-resistandplace-grup-3```
+cd capstoneproject-resistandplace-grup-3
 
+```text
 Upload the required firmware to the related microcontrollers and place the project source files in the appropriate directories.
 
 ## Usage
